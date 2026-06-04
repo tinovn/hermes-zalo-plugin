@@ -183,7 +183,7 @@ async function tryRestore() {
       language: "vi",
     });
     attachApi(api);
-    state.status = "connected";
+    state.status = "connected"; state.error = null;
     state.uid = api.getOwnId?.() || saved.uid;
     console.log(`[restore] OK, uid=${state.uid}`);
     broadcast({ type: "login_state", state: "connected", uid: state.uid });
@@ -235,7 +235,7 @@ async function startQrLogin() {
     });
 
     attachApi(api);
-    state.status = "connected";
+    state.status = "connected"; state.error = null;
     state.uid = api.getOwnId?.();
     console.log(`[login] connected, uid=${state.uid}`);
     broadcast({ type: "login_state", state: "connected", uid: state.uid });
@@ -323,7 +323,7 @@ function attachApi(api) {
 
   api.listener.on("connected", () => {
     console.log("[listener] WS connected");
-    state.status = "connected";
+    state.status = "connected"; state.error = null;
     wsReconnectAttempts = 0;
     if (wsReconnectTimer) { clearTimeout(wsReconnectTimer); wsReconnectTimer = null; }
     broadcast({ type: "listener_state", state: "connected" });

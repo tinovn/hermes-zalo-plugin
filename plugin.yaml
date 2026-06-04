@@ -1,0 +1,56 @@
+name: zalo-personal-platform
+label: Zalo (cá nhân)
+kind: platform
+version: 1.0.0
+description: >
+  Adapter Zalo cá nhân cho Hermes Agent qua sidecar Node.js (zca-js).
+  Dùng Zalo Web API không chính thức — KHUYẾN NGHỊ dùng SỐ PHỤ, không dùng số
+  chính. Tính năng: nhận/gửi tin, gửi ảnh/file/sticker/reaction, quét thành
+  viên nhóm theo link, phễu marketing (kết bạn / nhắn tin / Google Sheet CRM),
+  kết bạn & nhắn 1 người theo uid/SĐT/tag/tên.
+author: Cộng đồng
+license: "Dùng tự chịu trách nhiệm — xem README (rủi ro khoá tài khoản Zalo)."
+
+requires_env:
+  - name: ZALO_PERSONAL_OWNER_UID
+    description: "Zalo UID của chủ tài khoản (người điều khiển bot). Chỉ user này được toàn quyền."
+    prompt: "Owner Zalo UID"
+    password: false
+
+optional_env:
+  - name: ZALO_PERSONAL_OWNER_USER_ID
+    description: "Hermes user_id để map identity/memory (mặc định = OWNER_UID)."
+    prompt: "Owner Hermes user_id"
+    password: false
+  - name: ZALO_PERSONAL_ALLOWED_USERS
+    description: "Danh sách Zalo UID khác (phẩy ngăn cách) cũng được phép chat ngoài owner."
+    prompt: "Allowed Zalo UIDs"
+    password: false
+  - name: ZALO_PERSONAL_SIDECAR_PORT
+    description: "Port sidecar Node.js (mặc định 3838)."
+    prompt: "Sidecar port"
+    password: false
+  - name: ZALO_PERSONAL_PROXY
+    description: "Proxy cho sidecar (http://user:pass@host:port hoặc socks5://...). KHUYẾN NGHỊ proxy dân cư cùng quốc gia với số Zalo."
+    prompt: "Proxy URL"
+    password: true
+  - name: ZALO_PERSONAL_SESSION_DIR
+    description: "Thư mục lưu session + dữ liệu (mặc định /opt/data/zalo)."
+    prompt: "Session dir"
+    password: false
+  - name: ZALO_OWNER_NICKNAME
+    description: "Cách bot xưng hô với chủ (mặc định 'sếp')."
+    prompt: "Owner nickname"
+    password: false
+  - name: ZALO_OWNER_NAME
+    description: "Tên thật của chủ cần CHE khi bot lỡ nhắc (tùy chọn, mặc định trống = không che)."
+    prompt: "Owner real name (to redact)"
+    password: false
+  - name: GOOGLE_TOKEN_PATH
+    description: "Đường dẫn google_token.json (OAuth của BẠN) để bật xuất Google Sheet trong phễu marketing. Bỏ trống = không dùng Sheet."
+    prompt: "Google token path"
+    password: false
+  - name: ZALO_PERSONAL_HOME_THREAD
+    description: "Thread ID mặc định để cron/notification đẩy về."
+    prompt: "Home thread"
+    password: false

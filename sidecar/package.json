@@ -1,0 +1,21 @@
+{
+  "name": "hermes-zalo-sidecar",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Sidecar Node.js cầu nối Zalo Web API (zca-js) cho plugin Hermes Zalo cá nhân.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "zca-js": "2.1.2",
+    "express": "^4.19.2",
+    "ws": "^8.18.0",
+    "https-proxy-agent": "^7.0.5",
+    "undici": "^6.19.8"
+  }
+}

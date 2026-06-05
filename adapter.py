@@ -3076,7 +3076,16 @@ _NON_OWNER_BLOCKED_TOOLS: set = {
 }
 
 # Tools explicitly allowed for non-owner — these are safe-by-design.
-_NON_OWNER_ALLOWED_TOOLS: set = set()  # non-owner: KHONG duoc chay bat ky tool nao
+_NON_OWNER_ALLOWED_TOOLS: set = {
+    "zalo_react",
+    "zalo_send_sticker",
+    "web_search", "web_extract", "wiki", "currency", "weather",
+    "image_generate", "vision_analyze", "transcribe_audio",
+    "translate", "sympy", "calculator",
+    "zalo_group_summary",
+    "zalo_send_html", "zalo_send_pptx", "zalo_send_pdf", "zalo_send_xlsx",
+    "zalo_escalate_to_owner",
+}
 
 # Rate limit cho các tool gửi file (chống spam).
 _FILE_SEND_PER_CHAT_HOUR = 10

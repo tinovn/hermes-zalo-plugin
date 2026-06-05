@@ -3076,29 +3076,7 @@ _NON_OWNER_BLOCKED_TOOLS: set = {
 }
 
 # Tools explicitly allowed for non-owner — these are safe-by-design.
-_NON_OWNER_ALLOWED_TOOLS: set = {
-    "zalo_react",  # bot tu tha reaction — an toan, owner-only la zalo_set_reactions
-    "zalo_send_sticker",  # bot gui sticker — an toan cho non-owner
-    "web_search", "web_extract", "wiki", "currency", "weather",
-    "image_generate", "vision_analyze", "transcribe_audio",
-    "translate", "sympy", "calculator",
-    # zalo_group_summary: cho phép non-owner, NHƯNG chỉ tóm tắt đúng nhóm họ
-    # đang trò chuyện (enforce trong _zalo_pre_tool_call_hook: group_id phải
-    # khớp origin.chat_id). KHÔNG cho truy vấn group_id tuỳ ý — nếu không bất
-    # kỳ ai cũng moi được tin của nhóm riêng tư họ không tham gia.
-    # zalo_groups_list ĐÃ chuyển sang owner-only (liệt kê mọi nhóm + ID + tên
-    # thành viên là recon nguy hiểm cho người ngoài) — xem _NON_OWNER_BLOCKED_TOOLS.
-    "zalo_group_summary",
-    # File-generation tools — anh chọn "mở hết group" để nhân viên/khách
-    # trong group cũng nhờ bot tạo file được. Rate limit (10/giờ/chat,
-    # 5/giờ/user) thi hành ngay trong handler để chặn spam. Tool chỉ ghi
-    # vào uploads/ với UUID filename — không read arbitrary FS.
-    "zalo_send_html", "zalo_send_pptx", "zalo_send_pdf", "zalo_send_xlsx",
-    # Escalation — bot tự gọi khi bí / cần người thật. Non-owner (thành viên
-    # group) trigger được vì chính họ là người cần hỗ trợ; handler có cooldown
-    # chống spam + chỉ gửi DM cho owner, không lộ gì cho người ngoài.
-    "zalo_escalate_to_owner",
-}
+_NON_OWNER_ALLOWED_TOOLS: set = set()  # non-owner: KHONG duoc chay bat ky tool nao
 
 # Rate limit cho các tool gửi file (chống spam).
 _FILE_SEND_PER_CHAT_HOUR = 10
@@ -3366,29 +3344,51 @@ def _zalo_pre_tool_call_hook(
     allow. Only Zalo sessions are inspected — Telegram / API / other
     platforms are left alone (the operator runs those themselves).
     """
-    if not session_id:
-        return None
-    sjson_path = _hermes_home() / "sessions" / "sessions.json"
-    try:
-        with open(sjson_path, encoding="utf-8") as f:
-            sjson = json.load(f)
-    except Exception:
-        return None
-    # Find the session record by session_id and check its platform.
-    sess_record = None
-    for sess in sjson.values():
-        if sess.get("session_id") == session_id:
-            sess_record = sess
-            break
-    if not sess_record or sess_record.get("platform") != "zalo-personal":
-        return None
-    origin = sess_record.get("origin") or {}
-    user_id = str(origin.get("user_id") or "")
+    # FAIL-CLOSED owner gate. A tool runs only when we can CONFIRM the active
+    # Zalo session belongs to the owner. If we cannot resolve the session
+    # (session_id missing / not yet written / sessions.json unreadable) we must
+    # NOT silently allow — for any zalo_* or otherwise non-trivial tool we deny.
+    # Telegram/CLI/other platforms are never gated (only zalo-personal sessions
+    # or zalo_* tools are inspected).
     owner_user_id = (
         os.getenv("ZALO_PERSONAL_OWNER_USER_ID")
         or os.getenv("ZALO_PERSONAL_OWNER_UID")
         or ""
     ).strip()
+
+    _tname = (tool_name or "").lower().strip()
+    _base = _tname.split(".")[-1] if "." in _tname else _tname
+    _is_zalo_tool = _base.startswith("zalo_")
+
+    sess_record = None
+    if session_id:
+        try:
+            with open(_hermes_home() / "sessions" / "sessions.json", encoding="utf-8") as f:
+                sjson = json.load(f)
+            for sess in sjson.values():
+                if sess.get("session_id") == session_id:
+                    sess_record = sess
+                    break
+        except Exception:
+            sess_record = None
+
+    # Not a zalo session we can read:
+    if not sess_record or sess_record.get("platform") != "zalo-personal":
+        # If this is a zalo_* tool we still must protect it (could be a
+        # non-owner whose session we failed to resolve). Deny zalo_* outright;
+        # leave genuinely non-zalo tools (other platforms) alone.
+        if _is_zalo_tool and owner_user_id:
+            logger.warning(
+                "[zalo-personal] DENIED (unresolved session) zalo tool=%s session=%r",
+                tool_name, session_id,
+            )
+            return {
+                "action": "block",
+                "message": "Chuc nang nay chi thuc hien cho chu tai khoan (sep) thoi a.",
+            }
+        return None
+    origin = sess_record.get("origin") or {}
+    user_id = str(origin.get("user_id") or "")
     if user_id and owner_user_id and user_id == owner_user_id:
         return None  # Owner: full access.
     # ── Non-owner Zalo session — DEFAULT-DENY ─────────────────────────────

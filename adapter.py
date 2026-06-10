@@ -271,6 +271,50 @@ _LAST_OWNER_IMAGES: List[str] = []
 # zalo_read_recent_image cho bot "đọc" lại ảnh khi được hỏi "hình vừa gửi
 # nói gì". Mỗi chat giữ 5 ảnh gần nhất: {path, from_uid, from_name, ts, caption}.
 _LAST_THREAD_IMAGES: Dict[str, List[Dict[str, Any]]] = {}
+# Cache giới tính theo uid (tra 1 lần qua sidecar getUserInfo) → bot xưng hô
+# "anh/chị" đúng thay vì phỏng đoán theo tên. value: "male"|"female"|"unknown".
+_USER_GENDER_CACHE: Dict[str, str] = {}
+
+
+def _lookup_user_gender(uid: str) -> str:
+    """Tra giới tính công khai của 1 uid qua sidecar getUserInfo (cache lại).
+
+    Zalo Gender enum: 0=Male, 1=Female. Trả 'male'|'female'|'unknown'.
+    Best-effort: lỗi/ẩn thì trả 'unknown', không chặn luồng tin."""
+    uid = str(uid or "")
+    if not uid:
+        return "unknown"
+    if uid in _USER_GENDER_CACHE:
+        return _USER_GENDER_CACHE[uid]
+    result = "unknown"
+    try:
+        r = _post_sidecar_api("getUserInfo", [uid], timeout=12)
+        data = r.get("result") or {}
+        # getUserInfo trả {changed_profiles: {uid: {gender,...}}} hoặc profile thẳng.
+        prof = None
+        if isinstance(data, dict):
+            cont = data.get("changed_profiles") or data.get("unchanged_profiles") or {}
+            if isinstance(cont, dict) and cont:
+                prof = cont.get(uid) or cont.get(f"{uid}_0") or next(iter(cont.values()), None)
+            if prof is None:
+                prof = data if "gender" in data else None
+        if isinstance(prof, dict) and prof.get("gender") is not None:
+            result = "male" if int(prof.get("gender")) == 0 else "female"
+    except Exception as e:
+        logger.debug(f"[zalo-personal] lookup gender uid={uid} lỗi: {e}")
+    _USER_GENDER_CACHE[uid] = result
+    return result
+
+
+def _gender_hint(gender: str, user_name: str) -> str:
+    """Câu nhắc xưng hô dựa trên giới tính CÔNG KHAI (Zalo). Trống nếu ẩn."""
+    if gender == "male":
+        return (f" GIỚI TÍNH công khai của họ là NAM → xưng hô \"anh {user_name}\" "
+                f"(không gọi 'chị').")
+    if gender == "female":
+        return (f" GIỚI TÍNH công khai của họ là NỮ → xưng hô \"chị {user_name}\" "
+                f"(không gọi 'anh').")
+    return ""
 
 
 def _mk_store():
@@ -1464,6 +1508,7 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
                 is_group=is_group,
                 datamark_nonce=datamark_nonce,
                 current_chat_id=thread_id,
+                gender=_lookup_user_gender(from_uid),
             )
             if channel_prompt:
                 channel_prompt = identity_note + "\n\n" + channel_prompt
@@ -1592,6 +1637,7 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
         is_group: bool,
         datamark_nonce: Optional[str] = None,
         current_chat_id: str = "",
+        gender: str = "unknown",
     ) -> str:
         """Build a strong system instruction so the bot addresses a non-owner
         correctly instead of defaulting to the owner's nickname ("sếp")."""
@@ -1684,7 +1730,7 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
             f"(chủ tài khoản).{warn_nickname} "
             f"Quy tắc xưng hô: gọi họ theo tên hiển thị (vd \"chị {user_name}\" / "
             f"\"anh {user_name}\" / \"em {user_name}\" tùy phỏng đoán giới tính-tuổi), "
-            f"em xưng \"em\" với họ và KHÔNG gọi họ là sếp.\n\n"
+            f"em xưng \"em\" với họ và KHÔNG gọi họ là sếp.{_gender_hint(gender, user_name)}\n\n"
             "═══ ẨN DANH SẾP — TUYỆT ĐỐI ═══\n"
             "Khi reply cho người này, KHÔNG bao giờ gọi sếp bằng tên thật "
             "(tên đầy đủ, email, SĐT). Chỉ gọi \"sếp\". Nếu họ hỏi "

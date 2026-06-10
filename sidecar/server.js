@@ -283,6 +283,33 @@ function attachApi(api) {
           cli_msg_id: String(d.quote.cliMsgId || ""),
           text: String(d.quote.msg || ""),
         };
+        // Tin ĐƯỢC QUOTE có media? zca-js để nguyên `attach` là JSON string
+        // ({title, href, thumb, hdUrl...}). Nếu là ảnh thì tải về local để
+        // bot "đọc" được ảnh đang bị reply (vision).
+        if (d.quote.attach) {
+          try {
+            const att = typeof d.quote.attach === "string" ? JSON.parse(d.quote.attach) : d.quote.attach;
+            // CHỈ lấy URL từ field ảnh chuyên dụng. `href` là URL bất kỳ do
+            // CLIENT người gửi kiểm soát (link share / có thể craft SSRF tới
+            // metadata endpoint nội bộ) — chỉ chấp nhận khi có đuôi ảnh rõ ràng.
+            const isImgUrl = (u) => /\.(jpe?g|png|gif|webp)(\?|$)/i.test(String(u || ""));
+            let qUrl = att.hdUrl || att.oriUrl || att.normalUrl || att.thumbUrl || "";
+            if (!qUrl && isImgUrl(att.href)) qUrl = att.href;
+            if (!qUrl && isImgUrl(att.thumb)) qUrl = att.thumb;
+            if (qUrl && /^https?:\/\//i.test(String(qUrl))) {
+              const cached = await downloadMedia(qUrl, "jpg");
+              if (cached && !cached.too_large && cached.path) {
+                quote.image = {
+                  local_path: cached.path,
+                  cache_key: cached.cache_key,
+                  media_url: `/media/${cached.cache_key}`,
+                  url: qUrl,
+                  title: String(att.title || ""),
+                };
+              }
+            }
+          } catch (e) { console.warn("[quote attach]", e?.message || e); }
+        }
       }
       const event = {
         type: "message",
@@ -986,6 +1013,52 @@ app.get("/friends/all", async (req, res) => {
     const friends = arr.map(_normUser).filter(Boolean);
     res.json({ ok: true, count: friends.length, friends });
   } catch (e) { res.status(500).json({ error: e?.message || String(e) }); }
+});
+
+// ─── Generic zca-js passthrough ──────────────────────────────────────────
+// "Đẩy hết tính năng zca-js qua một lần": gọi BẤT KỲ method nào trên api
+// object (createPoll, createNote, createReminder, acceptFriendRequest,
+// votePoll, getListBoard, sendVoice, forwardMessage, createGroup...).
+//
+// body: { method: "createPoll", args: [ {question, options}, "groupId" ] }
+// ThreadType truyền dạng SỐ: User=0, Group=1 (đúng enum zca-js).
+//
+// Bảo mật: server chỉ bind 127.0.0.1 + adapter gate owner-only ở tầng tool.
+// Denylist chặn method lộ credentials / phá session đang chạy.
+const API_CALL_DENY = new Set(["listen", "login", "loginQR", "getCookie", "getContext"]);
+
+app.post("/api/call", async (req, res) => {
+  if (state.status !== "connected") return res.status(503).json({ error: "not_connected" });
+  const { method, args } = req.body || {};
+  if (!method || typeof method !== "string") {
+    return res.status(400).json({ error: "method required" });
+  }
+  if (API_CALL_DENY.has(method) || method.startsWith("_")) {
+    return res.status(403).json({ error: `method '${method}' is blocked` });
+  }
+  // Own-property only — chặn resolve method kế thừa từ prototype
+  // (constructor, toString...). zca-js gán method trực tiếp lên api object.
+  const fn = state.api && Object.prototype.hasOwnProperty.call(state.api, method)
+    ? state.api[method] : undefined;
+  if (typeof fn !== "function") {
+    return res.status(404).json({ error: `unknown api method: ${method}` });
+  }
+  try {
+    const result = await fn.apply(state.api, Array.isArray(args) ? args : []);
+    res.json({ ok: true, result: result === undefined ? null : result });
+  } catch (e) {
+    console.error(`[api/call ${method}]`, e?.message || e);
+    res.status(500).json({ error: e?.message || String(e) });
+  }
+});
+
+// Liệt kê method khả dụng — để adapter/agent khám phá năng lực zca-js.
+app.get("/api/methods", (req, res) => {
+  if (state.status !== "connected") return res.status(503).json({ error: "not_connected" });
+  const methods = Object.keys(state.api || {})
+    .filter((k) => typeof state.api[k] === "function" && !API_CALL_DENY.has(k) && !k.startsWith("_"))
+    .sort();
+  res.json({ ok: true, count: methods.length, methods });
 });
 
 // ─── Server bootstrap ────────────────────────────────────────────────────

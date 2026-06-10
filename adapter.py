@@ -267,6 +267,10 @@ _LAST_MENTIONS: Dict[str, List[str]] = {}
 # Đường dẫn file ảnh sếp (owner) vừa gửi cho bot (để nhắn marketing kèm ảnh
 # "mấy ảnh em vừa gửi"). Giữ tối đa 10 ảnh gần nhất.
 _LAST_OWNER_IMAGES: List[str] = []
+# Ảnh GẦN NHẤT theo từng chat (MỌI người gửi, không chỉ owner) → tool
+# zalo_read_recent_image cho bot "đọc" lại ảnh khi được hỏi "hình vừa gửi
+# nói gì". Mỗi chat giữ 5 ảnh gần nhất: {path, from_uid, from_name, ts, caption}.
+_LAST_THREAD_IMAGES: Dict[str, List[Dict[str, Any]]] = {}
 
 
 def _mk_store():
@@ -997,6 +1001,22 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
                 logger.warning(f"[zalo-mkt-diag] bắt ảnh owner: {_c['local_path']} (tổng {len(_LAST_OWNER_IMAGES)})")
         except Exception:
             pass
+        # Nhớ ảnh GẦN NHẤT theo chat (mọi người gửi) → zalo_read_recent_image
+        # cho phép bot đọc lại ảnh khi được hỏi sau đó.
+        try:
+            if isinstance(_c, dict) and _c.get("kind") == "image" and _c.get("local_path"):
+                _tid_img = str(event.get("thread_id") or from_uid)
+                _imgs = _LAST_THREAD_IMAGES.setdefault(_tid_img, [])
+                _imgs.append({
+                    "path": str(_c["local_path"]),
+                    "from_uid": from_uid,
+                    "from_name": str(event.get("from_name") or ""),
+                    "ts": event.get("ts") or 0,
+                    "caption": str(_c.get("title") or _c.get("caption") or ""),
+                })
+                del _imgs[:-5]  # giữ 5 ảnh gần nhất mỗi chat
+        except Exception:
+            pass
         # Bỏ qua tin HỆ THỐNG của Zalo (nhắc lịch/reminder, thông báo poll,
         # sự kiện nhóm...). Người gửi hiển thị là "Zalo" → KHÔNG phải người
         # thật; nếu xử lý, bot sẽ reply vào reminder và tưởng nhầm có "chị
@@ -1235,6 +1255,26 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
         else:
             logger.info(f"[zalo-personal] unknown content kind={kind}, skipping")
             return
+
+        # Ảnh trong tin ĐƯỢC QUOTE (user reply vào một tin có ảnh): sidecar
+        # đã tải về local (quote.image.local_path) — đính vào media để model
+        # NHÌN THẤY ảnh đang được nhắc tới khi trả lời.
+        try:
+            _q = event.get("quote") or {}
+            _q_img = (_q.get("image") or {}) if isinstance(_q, dict) else {}
+            _q_path = str(_q_img.get("local_path") or "")
+            if _q_path and Path(_q_path).exists():
+                media_urls.append(_q_path)
+                media_types.append("image")
+                if message_type == MessageType.TEXT:
+                    message_type = MessageType.PHOTO
+                _q_note = (
+                    "[Người dùng đang REPLY vào một tin có ẢNH — ảnh đó đã được "
+                    "đính kèm trong media của tin này, hãy nhìn ảnh khi trả lời.]"
+                )
+                text = f"{text}\n\n{_q_note}".strip() if text else _q_note
+        except Exception as _qe:
+            logger.debug(f"[zalo-personal] quote image attach failed: {_qe}")
 
         if not text and not media_urls:
             return
@@ -2615,6 +2655,27 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
             "tên thật trong group (case-sensitive, có dấu Việt) — sai 1 ký "
             "tự là chỉ ra plain text. Nếu không chắc tên, KHÔNG bịa, hỏi "
             "lại sếp hoặc bỏ qua mention.\n\n"
+            "9. Poll / Ghi chú / Nhắc hẹn / Bảng tin nhóm:\n"
+            "   • \"tạo poll/bình chọn ...\" → zalo_create_poll(question, "
+            "options=[...], multi_choice?, anonymous?, expires_hours?)\n"
+            "   • \"ghi chú lại ...\", \"tạo note nhóm\" → zalo_create_note("
+            "title, pin?)\n"
+            "   • \"nhắc nhóm họp 9h sáng mai\", \"tạo reminder\" → "
+            "zalo_create_reminder(title, at='YYYY-MM-DD HH:MM' hoặc "
+            "in_minutes=N, repeat=daily/weekly/monthly?)\n"
+            "   • Xem/sửa bảng tin: zalo_board_action(action=list → liệt kê "
+            "note/poll/reminder kèm id; poll_detail/poll_lock/poll_vote; "
+            "note_edit; reminder_remove)\n\n"
+            "10. Kết bạn & năng lực Zalo mở rộng:\n"
+            "   • \"chấp nhận kết bạn người này\" → zalo_friend_accept(uid)\n"
+            "   • \"đọc hình vừa gửi/hình trên nói gì\" → "
+            "zalo_read_recent_image() lấy path → vision_analyze để đọc. "
+            "(Ảnh người dùng REPLY kèm quote cũng tự đính vào tin — nhìn "
+            "media trước khi gọi tool.)\n"
+            "   • Nhu cầu khác chưa có tool riêng (forward tin, gửi voice, "
+            "gửi danh thiếp, tạo nhóm, thêm/xoá thành viên, đổi tên nhóm, "
+            "block user, tra user...) → zalo_api_call(method, args) gọi "
+            "thẳng zca-js. ThreadType: 0=User, 1=Group.\n\n"
             "QUAN TRỌNG:\n"
             "• KHÔNG chỉ ghi nhận \"dạ em nhớ rồi\" — phải gọi tool. Memory "
             "không override identity_note, chỉ tool persist mới đổi behavior thật.\n"
@@ -3073,6 +3134,11 @@ _NON_OWNER_BLOCKED_TOOLS: set = {
     # zalo_list_products is read-only; safe but still owner-only to avoid
     # leaking the product list to random group members.
     "zalo_list_products",
+    # zca-js passthrough tools — owner-only. Poll/note/reminder thay đổi
+    # nội dung nhóm; friend_accept đổi danh bạ; api_call là power tool
+    # gọi được MỌI method zca-js (nguy hiểm nếu non-owner điều khiển).
+    "zalo_create_poll", "zalo_create_note", "zalo_create_reminder",
+    "zalo_board_action", "zalo_friend_accept", "zalo_api_call",
 }
 
 # Tools explicitly allowed for non-owner — these are safe-by-design.
@@ -3085,6 +3151,9 @@ _NON_OWNER_ALLOWED_TOOLS: set = {
     "zalo_group_summary",
     "zalo_send_html", "zalo_send_pptx", "zalo_send_pdf", "zalo_send_xlsx",
     "zalo_escalate_to_owner",
+    # Đọc ảnh gần nhất: an toàn — handler ÉP scope vào chat hiện tại của
+    # task (không peek chat khác), chỉ trả path ảnh đã cache của chính chat đó.
+    "zalo_read_recent_image",
 }
 
 # Rate limit cho các tool gửi file (chống spam).
@@ -3525,8 +3594,34 @@ def _scrub_leak(text: str) -> str:
 # (e.g. owner DMs "tóm tắt group X" → agent calls zalo_group_summary).
 # ---------------------------------------------------------------------------
 
+_HERMES_HOME_CACHE: Optional[Path] = None
+
+
 def _hermes_home() -> Path:
-    return Path(os.getenv("HERMES_HOME", "/opt/data"))
+    """Thư mục data Hermes (chứa sessions/sessions.json).
+
+    Thứ tự: env HERMES_HOME → /opt/data → ~/.hermes → /opt/hermes/data.
+    Tự dò nơi THỰC SỰ có sessions/sessions.json vì trên một số server
+    HERMES_HOME không được export sang process plugin — nếu trỏ sai,
+    owner-gate fail-closed sẽ chặn mọi tool zalo_* kể cả của owner
+    ("unresolved session"). Cache kết quả dò ĐƯỢC (positive) để khỏi
+    stat lặp lại mỗi tool call; chưa dò được thì thử lại lần sau."""
+    global _HERMES_HOME_CACHE
+    env = os.getenv("HERMES_HOME")
+    if env:
+        return Path(env)
+    if _HERMES_HOME_CACHE is not None:
+        return _HERMES_HOME_CACHE
+    for cand in (Path("/opt/data"), Path.home() / ".hermes", Path("/opt/hermes/data")):
+        try:
+            if (cand / "sessions" / "sessions.json").exists():
+                _HERMES_HOME_CACHE = cand
+                if cand != Path("/opt/data"):
+                    logger.warning(f"[zalo-personal] HERMES_HOME không set — tự dò ra data dir: {cand}")
+                return cand
+        except Exception:
+            continue
+    return Path("/opt/data")
 
 
 def _load_sessions_json() -> Dict[str, Any]:
@@ -6488,6 +6583,291 @@ def _set_channel_active_handler(args=None, **kwargs):
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# ZCA-JS PASSTHROUGH — poll / note / reminder / friend-accept / đọc ảnh /
+# generic api_call. Mọi method zca-js đi qua sidecar POST /api/call.
+# ═══════════════════════════════════════════════════════════════════════
+def _post_sidecar_api(method: str, call_args: List[Any], timeout: int = 30) -> Dict[str, Any]:
+    """Gọi generic passthrough /api/call của sidecar → bất kỳ method zca-js.
+
+    Trả dict {ok, result} hoặc {error}. ThreadType truyền số: User=0, Group=1."""
+    import urllib.request
+    import urllib.error
+    port = int(os.getenv("ZALO_PERSONAL_SIDECAR_PORT", "3838"))
+    body = json.dumps({"method": method, "args": call_args}).encode("utf-8")
+    req = urllib.request.Request(
+        "http://127.0.0.1:%d/api/call" % port, data=body,
+        headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        try:
+            return json.loads(e.read().decode("utf-8", "replace"))
+        except Exception:
+            return {"error": "HTTP %s" % e.code}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _zalo_thread_type_num(chat_id: str) -> int:
+    """ThreadType số cho zca-js: User=0, Group=1."""
+    return 1 if _infer_zalo_thread_type(chat_id) == "group" else 0
+
+
+def _tool_chat_id(p: Dict[str, Any], kwargs: Dict[str, Any]) -> str:
+    """chat_id từ param hoặc fallback chat hiện tại của task."""
+    cid = _coerce_str_arg(p.get("chat_id", ""))
+    if not cid:
+        cid = _resolve_current_chat_id_from_task(_coerce_str_arg(kwargs.get("task_id", "")))
+    return cid
+
+
+def _zalo_create_poll_handler(args: Any = None, **kwargs) -> Dict[str, Any]:
+    """Tạo poll (bình chọn) trong group."""
+    p = _extract_tool_params(args, kwargs)
+    chat_id = _tool_chat_id(p, kwargs)
+    question = _coerce_str_arg(p.get("question", ""))
+    options = p.get("options") or []
+    if isinstance(options, str):
+        sep = "\n" if "\n" in options else ","
+        options = [o.strip() for o in options.split(sep) if o.strip()]
+    options = [str(o).strip() for o in options if str(o).strip()]
+    if not chat_id:
+        return {"success": False, "error": "chat_id required"}
+    if _infer_zalo_thread_type(chat_id) != "group":
+        return {"success": False, "error": "Poll chỉ tạo được trong NHÓM, không tạo được trong chat 1-1."}
+    if not question or len(options) < 2:
+        return {"success": False, "error": "Cần question và ít nhất 2 options."}
+    opts: Dict[str, Any] = {
+        "question": question,
+        "options": options[:10],
+        "allowMultiChoices": bool(p.get("multi_choice", False)),
+        "allowAddNewOption": bool(p.get("allow_add_option", False)),
+        "hideVotePreview": bool(p.get("hide_results", False)),
+        "isAnonymous": bool(p.get("anonymous", False)),
+    }
+    try:
+        hours = float(p.get("expires_hours") or 0)
+    except Exception:
+        hours = 0
+    if hours > 0:
+        opts["expiredTime"] = int((time.time() + hours * 3600) * 1000)
+    r = _post_sidecar_api("createPoll", [opts, str(chat_id)])
+    if r.get("error"):
+        return {"success": False, "error": r["error"]}
+    poll = r.get("result") or {}
+    return {"success": True, "poll_id": poll.get("id") or poll.get("poll_id"),
+            "question": question, "options": opts["options"],
+            "hint": "Poll đã tạo trong nhóm. Báo NGẮN gọn, kèm poll_id nếu sếp cần khoá/xem kết quả sau."}
+
+
+def _zalo_create_note_handler(args: Any = None, **kwargs) -> Dict[str, Any]:
+    """Tạo ghi chú (note) trên bảng tin nhóm."""
+    p = _extract_tool_params(args, kwargs)
+    chat_id = _tool_chat_id(p, kwargs)
+    title = _coerce_str_arg(p.get("title", "")) or _coerce_str_arg(p.get("content", ""))
+    if not chat_id:
+        return {"success": False, "error": "chat_id required"}
+    if _infer_zalo_thread_type(chat_id) != "group":
+        return {"success": False, "error": "Ghi chú chỉ tạo được trong NHÓM."}
+    if not title:
+        return {"success": False, "error": "title (nội dung ghi chú) required"}
+    r = _post_sidecar_api("createNote", [{"title": title, "pinAct": bool(p.get("pin", False))}, str(chat_id)])
+    if r.get("error"):
+        return {"success": False, "error": r["error"]}
+    note = r.get("result") or {}
+    return {"success": True, "topic_id": note.get("id") or note.get("topicId"),
+            "hint": "Ghi chú đã đăng lên bảng tin nhóm. Báo NGẮN gọn."}
+
+
+_REMINDER_REPEAT = {"none": 0, "daily": 1, "weekly": 2, "monthly": 3}
+
+
+def _zalo_create_reminder_handler(args: Any = None, **kwargs) -> Dict[str, Any]:
+    """Tạo nhắc hẹn Zalo (chat 1-1 hoặc nhóm)."""
+    p = _extract_tool_params(args, kwargs)
+    chat_id = _tool_chat_id(p, kwargs)
+    title = _coerce_str_arg(p.get("title", ""))
+    if not chat_id or not title:
+        return {"success": False, "error": "chat_id và title required"}
+    opts: Dict[str, Any] = {"title": title}
+    emoji = _coerce_str_arg(p.get("emoji", ""))
+    if emoji:
+        opts["emoji"] = emoji
+    # Thời điểm nhắc: "at" = "YYYY-MM-DD HH:MM" (giờ máy chủ) hoặc
+    # "in_minutes" = số phút kể từ bây giờ. Bỏ trống = nhắc ngay.
+    at_str = _coerce_str_arg(p.get("at", ""))
+    start_ms: Optional[int] = None
+    if at_str:
+        import datetime
+        from zoneinfo import ZoneInfo
+        _tz_vn = ZoneInfo("Asia/Ho_Chi_Minh")  # cố định giờ VN, không phụ thuộc TZ máy chủ
+        for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%d/%m/%Y %H:%M"):
+            try:
+                dt = datetime.datetime.strptime(at_str, fmt).replace(tzinfo=_tz_vn)
+                start_ms = int(dt.timestamp() * 1000)
+                break
+            except ValueError:
+                continue
+        if start_ms is None:
+            return {"success": False, "error": "at không đúng định dạng 'YYYY-MM-DD HH:MM'"}
+    else:
+        try:
+            mins = float(p.get("in_minutes") or 0)
+        except Exception:
+            mins = 0
+        if mins > 0:
+            start_ms = int((time.time() + mins * 60) * 1000)
+    if start_ms is not None:
+        opts["startTime"] = start_ms
+    repeat = _coerce_str_arg(p.get("repeat", "none")).lower()
+    opts["repeat"] = _REMINDER_REPEAT.get(repeat, 0)
+    r = _post_sidecar_api("createReminder", [opts, str(chat_id), _zalo_thread_type_num(chat_id)])
+    if r.get("error"):
+        return {"success": False, "error": r["error"]}
+    rem = r.get("result") or {}
+    return {"success": True, "reminder_id": rem.get("id") or rem.get("reminderId"),
+            "hint": "Nhắc hẹn đã tạo trên Zalo. Báo NGẮN gọn kèm thời gian nhắc."}
+
+
+def _zalo_board_action_handler(args: Any = None, **kwargs) -> Dict[str, Any]:
+    """Thao tác bảng tin nhóm: list / poll_detail / poll_lock / poll_vote /
+    note_edit / reminder_remove / reminder_list."""
+    p = _extract_tool_params(args, kwargs)
+    action = _coerce_str_arg(p.get("action", "")).lower()
+    chat_id = _tool_chat_id(p, kwargs)
+    if action == "list":
+        if not chat_id:
+            return {"success": False, "error": "chat_id required"}
+        r = _post_sidecar_api("getListBoard", [{"page": 1, "count": 20}, str(chat_id)])
+    elif action == "poll_detail":
+        try:
+            r = _post_sidecar_api("getPollDetail", [int(str(p.get("poll_id")))])
+        except (TypeError, ValueError):
+            return {"success": False, "error": "poll_id (số) required"}
+    elif action == "poll_lock":
+        try:
+            r = _post_sidecar_api("lockPoll", [int(str(p.get("poll_id")))])
+        except (TypeError, ValueError):
+            return {"success": False, "error": "poll_id (số) required"}
+    elif action == "poll_vote":
+        opt_ids = p.get("option_ids") or []
+        if isinstance(opt_ids, str):
+            opt_ids = [x.strip() for x in opt_ids.split(",") if x.strip()]
+        if not opt_ids:
+            return {"success": False, "error": "option_ids rỗng — cần ít nhất 1 lựa chọn để vote"}
+        try:
+            r = _post_sidecar_api("votePoll", [int(str(p.get("poll_id"))), [int(str(x)) for x in opt_ids]])
+        except (TypeError, ValueError):
+            return {"success": False, "error": "poll_id + option_ids (số) required"}
+    elif action == "note_edit":
+        topic_id = _coerce_str_arg(p.get("topic_id", ""))
+        title = _coerce_str_arg(p.get("title", ""))
+        if not chat_id or not topic_id or not title:
+            return {"success": False, "error": "chat_id, topic_id, title required"}
+        r = _post_sidecar_api("editNote", [
+            {"title": title, "topicId": topic_id, "pinAct": bool(p.get("pin", False))}, str(chat_id)])
+    elif action == "reminder_remove":
+        rid = _coerce_str_arg(p.get("reminder_id", ""))
+        if not chat_id or not rid:
+            return {"success": False, "error": "chat_id và reminder_id required"}
+        r = _post_sidecar_api("removeReminder", [rid, str(chat_id), _zalo_thread_type_num(chat_id)])
+    elif action == "reminder_list":
+        if not chat_id:
+            return {"success": False, "error": "chat_id required"}
+        r = _post_sidecar_api("getListReminder", [{"page": 1, "count": 20}, str(chat_id), _zalo_thread_type_num(chat_id)])
+    else:
+        return {"success": False, "error": "action không hợp lệ. Hợp lệ: list, poll_detail, poll_lock, "
+                                           "poll_vote, note_edit, reminder_remove, reminder_list"}
+    if r.get("error"):
+        return {"success": False, "error": r["error"]}
+    # Cắt bớt kết quả lớn để không phình context.
+    out = json.dumps(r.get("result"), ensure_ascii=False, default=str)
+    if len(out) > 6000:
+        out = out[:6000] + "...[cắt bớt]"
+    return {"success": True, "action": action, "result": out}
+
+
+def _zalo_friend_accept_handler(args: Any = None, **kwargs) -> Dict[str, Any]:
+    """Chấp nhận lời mời kết bạn từ uid chỉ định."""
+    p = _extract_tool_params(args, kwargs)
+    uid = _coerce_str_arg(p.get("uid", ""))
+    if not uid:
+        return {"success": False, "error": "uid required"}
+    r = _post_sidecar_api("acceptFriendRequest", [str(uid)])
+    if r.get("error"):
+        return {"success": False, "error": r["error"]}
+    logger.info("[zalo-personal] accepted friend request uid=%s" % uid)
+    return {"success": True, "uid": uid, "hint": "Đã chấp nhận kết bạn. Báo NGẮN gọn."}
+
+
+def _zalo_read_recent_image_handler(args: Any = None, **kwargs) -> Dict[str, Any]:
+    """Lấy đường dẫn ảnh GẦN NHẤT trong chat HIỆN TẠI để vision_analyze đọc.
+
+    Bảo mật: LUÔN ưu tiên chat hiện tại từ task — không cho peek chat khác."""
+    p = _extract_tool_params(args, kwargs)
+    # CHỈ nhận chat hiện tại từ task — KHÔNG fallback chat_id do model truyền
+    # (tool này allow non-owner; fallback sẽ mở đường peek ảnh chat khác).
+    chat_id = _resolve_current_chat_id_from_task(_coerce_str_arg(kwargs.get("task_id", "")))
+    if not chat_id:
+        return {"success": False, "error": "không xác định được chat hiện tại"}
+    imgs = _LAST_THREAD_IMAGES.get(str(chat_id)) or []
+    try:
+        n = max(1, min(int(p.get("count") or 1), 5))
+    except (TypeError, ValueError):
+        n = 1
+    out = []
+    for rec in reversed(imgs[-n:] if imgs else []):
+        try:
+            if Path(str(rec.get("path") or "")).exists():
+                out.append({
+                    "path": rec["path"],
+                    "from": rec.get("from_name") or rec.get("from_uid") or "",
+                    "caption": rec.get("caption") or "",
+                })
+        except Exception:
+            continue
+    if not out:
+        return {"success": False,
+                "error": "Chưa có ảnh nào trong chat này (bot chỉ nhớ ảnh từ lúc chạy, giữ 5 ảnh gần nhất)."}
+    return {"success": True, "images": out,
+            "hint": "Gọi vision_analyze với từng path để đọc nội dung ảnh, rồi trả lời người dùng."}
+
+
+def _zalo_api_call_handler(args: Any = None, **kwargs) -> Dict[str, Any]:
+    """CHỈ owner: gọi trực tiếp BẤT KỲ method zca-js nào qua sidecar.
+
+    Phủ toàn bộ tính năng còn lại: forwardMessage, sendVoice, sendCard,
+    createGroup, addUserToGroup, changeGroupName, blockUser, findUser,
+    getUserInfo, deleteMessage, undo, setMute, addQuickMessage..."""
+    p = _extract_tool_params(args, kwargs)
+    method = _coerce_str_arg(p.get("method", ""))
+    if not method:
+        return {"success": False, "error": "method required"}
+    raw_args = p.get("args")
+    if isinstance(raw_args, str) and raw_args.strip():
+        try:
+            raw_args = json.loads(raw_args)
+        except Exception as e:
+            return {"success": False, "error": "args không phải JSON hợp lệ: %s" % e}
+    if raw_args is None:
+        raw_args = []
+    if not isinstance(raw_args, list):
+        raw_args = [raw_args]
+    # Audit log: power tool gọi được mọi method zca-js — ghi WARNING đầy đủ
+    # để truy vết khi nghi prompt-injection điều khiển owner session.
+    logger.warning("[zalo-api-call] method=%s args=%s" % (
+        method, json.dumps(raw_args, ensure_ascii=False, default=str)[:1000]))
+    r = _post_sidecar_api(method, raw_args, timeout=60)
+    if r.get("error"):
+        return {"success": False, "error": r["error"]}
+    out = json.dumps(r.get("result"), ensure_ascii=False, default=str)
+    if len(out) > 8000:
+        out = out[:8000] + "...[cắt bớt]"
+    return {"success": True, "method": method, "result": out}
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # PHỄU MARKETING — helper module-level + tool handler
 # ═══════════════════════════════════════════════════════════════════════
 def _mk_today() -> str:
@@ -8326,9 +8706,119 @@ def _register_zalo_tools(ctx) -> None:
                 "parameters": {"type": "object", "properties": {
                     "campaign": {"type": "string"}}, "required": ["campaign"]}}},
             handler=_zalo_campaign_sync_handler, description="Đồng bộ Sheet chiến dịch.", emoji="🔄")
+        # ── zca-js passthrough tools: poll / note / reminder / board /
+        #    friend-accept / đọc ảnh gần nhất / generic api_call ──────────
+        ctx.register_tool(
+            name="zalo_create_poll", toolset="hermes-zalo",
+            schema={"type": "function", "function": {
+                "name": "zalo_create_poll",
+                "description": (
+                    "Tạo POLL (bình chọn) trong nhóm Zalo hiện tại. Dùng khi sếp nói "
+                    "'tạo poll/bình chọn/khảo sát ...'. Cần câu hỏi + ít nhất 2 lựa chọn."),
+                "parameters": {"type": "object", "properties": {
+                    "question": {"type": "string", "description": "Câu hỏi bình chọn"},
+                    "options": {"type": "array", "items": {"type": "string"}, "description": "Các lựa chọn (2-10)"},
+                    "chat_id": {"type": "string", "description": "Group ID (bỏ trống = nhóm hiện tại)"},
+                    "multi_choice": {"type": "boolean", "description": "Cho chọn nhiều đáp án"},
+                    "allow_add_option": {"type": "boolean", "description": "Cho thành viên thêm lựa chọn"},
+                    "hide_results": {"type": "boolean", "description": "Ẩn kết quả tới khi vote"},
+                    "anonymous": {"type": "boolean", "description": "Ẩn danh người vote"},
+                    "expires_hours": {"type": "number", "description": "Hết hạn sau N giờ (0 = không hết hạn)"}},
+                    "required": ["question", "options"]}}},
+            handler=_zalo_create_poll_handler, description="Tạo poll trong nhóm Zalo.", emoji="🗳")
+        ctx.register_tool(
+            name="zalo_create_note", toolset="hermes-zalo",
+            schema={"type": "function", "function": {
+                "name": "zalo_create_note",
+                "description": (
+                    "Tạo GHI CHÚ (note) lên bảng tin nhóm Zalo. Dùng khi sếp nói "
+                    "'ghi chú lại ...', 'tạo note trong nhóm ...'. Có thể ghim (pin)."),
+                "parameters": {"type": "object", "properties": {
+                    "title": {"type": "string", "description": "Nội dung ghi chú"},
+                    "chat_id": {"type": "string", "description": "Group ID (bỏ trống = nhóm hiện tại)"},
+                    "pin": {"type": "boolean", "description": "Ghim ghi chú lên đầu nhóm"}},
+                    "required": ["title"]}}},
+            handler=_zalo_create_note_handler, description="Tạo ghi chú bảng tin nhóm.", emoji="📝")
+        ctx.register_tool(
+            name="zalo_create_reminder", toolset="hermes-zalo",
+            schema={"type": "function", "function": {
+                "name": "zalo_create_reminder",
+                "description": (
+                    "Tạo NHẮC HẸN Zalo trong chat hiện tại (1-1 hoặc nhóm). Dùng khi sếp nói "
+                    "'nhắc cả nhóm họp lúc 9h', 'tạo reminder ...'. Thời gian: at='YYYY-MM-DD HH:MM' "
+                    "hoặc in_minutes=N phút nữa."),
+                "parameters": {"type": "object", "properties": {
+                    "title": {"type": "string", "description": "Nội dung nhắc"},
+                    "chat_id": {"type": "string", "description": "Thread ID (bỏ trống = chat hiện tại)"},
+                    "at": {"type": "string", "description": "Thời điểm nhắc 'YYYY-MM-DD HH:MM' (giờ VN)"},
+                    "in_minutes": {"type": "number", "description": "Hoặc: nhắc sau N phút"},
+                    "emoji": {"type": "string", "description": "Emoji nhắc (mặc định ⏰)"},
+                    "repeat": {"type": "string", "enum": ["none", "daily", "weekly", "monthly"],
+                               "description": "Lặp lại"}},
+                    "required": ["title"]}}},
+            handler=_zalo_create_reminder_handler, description="Tạo nhắc hẹn Zalo.", emoji="⏰")
+        ctx.register_tool(
+            name="zalo_board_action", toolset="hermes-zalo",
+            schema={"type": "function", "function": {
+                "name": "zalo_board_action",
+                "description": (
+                    "Thao tác BẢNG TIN nhóm Zalo: action=list (liệt kê note/poll/reminder + id), "
+                    "poll_detail (xem kết quả poll), poll_lock (khoá poll), poll_vote (vote hộ), "
+                    "note_edit (sửa ghi chú), reminder_remove (xoá nhắc hẹn), reminder_list."),
+                "parameters": {"type": "object", "properties": {
+                    "action": {"type": "string", "enum": ["list", "poll_detail", "poll_lock", "poll_vote",
+                                                          "note_edit", "reminder_remove", "reminder_list"]},
+                    "chat_id": {"type": "string", "description": "Thread ID (bỏ trống = chat hiện tại)"},
+                    "poll_id": {"type": "integer", "description": "ID poll (cho poll_*)"},
+                    "option_ids": {"type": "array", "items": {"type": "integer"}, "description": "ID lựa chọn (poll_vote)"},
+                    "topic_id": {"type": "string", "description": "ID ghi chú (note_edit)"},
+                    "title": {"type": "string", "description": "Nội dung mới (note_edit)"},
+                    "pin": {"type": "boolean", "description": "Ghim (note_edit)"},
+                    "reminder_id": {"type": "string", "description": "ID nhắc hẹn (reminder_remove)"}},
+                    "required": ["action"]}}},
+            handler=_zalo_board_action_handler, description="Quản lý bảng tin nhóm (poll/note/reminder).", emoji="📋")
+        ctx.register_tool(
+            name="zalo_friend_accept", toolset="hermes-zalo",
+            schema={"type": "function", "function": {
+                "name": "zalo_friend_accept",
+                "description": (
+                    "CHẤP NHẬN lời mời kết bạn từ một uid. Dùng khi sếp nói 'chấp nhận kết bạn "
+                    "người này' (uid từ thông báo lời mời hoặc zalo_lookup_phones)."),
+                "parameters": {"type": "object", "properties": {
+                    "uid": {"type": "string", "description": "Zalo UID người gửi lời mời"}},
+                    "required": ["uid"]}}},
+            handler=_zalo_friend_accept_handler, description="Chấp nhận lời mời kết bạn.", emoji="🤝")
+        ctx.register_tool(
+            name="zalo_read_recent_image", toolset="hermes-zalo",
+            schema={"type": "function", "function": {
+                "name": "zalo_read_recent_image",
+                "description": (
+                    "Lấy đường dẫn ẢNH GẦN NHẤT người dùng đã gửi trong chat HIỆN TẠI "
+                    "(giữ 5 ảnh gần nhất). Dùng khi được hỏi 'hình vừa gửi nói gì', 'đọc ảnh trên'. "
+                    "Sau khi có path, gọi vision_analyze để đọc nội dung ảnh."),
+                "parameters": {"type": "object", "properties": {
+                    "count": {"type": "integer", "description": "Số ảnh gần nhất cần lấy (1-5, mặc định 1)"}}}}},
+            handler=_zalo_read_recent_image_handler, description="Lấy ảnh gần nhất trong chat để đọc.", emoji="🖼")
+        ctx.register_tool(
+            name="zalo_api_call", toolset="hermes-zalo",
+            schema={"type": "function", "function": {
+                "name": "zalo_api_call",
+                "description": (
+                    "CHỈ owner — power tool: gọi TRỰC TIẾP một method zca-js bất kỳ. "
+                    "Ví dụ: forwardMessage, sendVoice, sendCard, createGroup, addUserToGroup, "
+                    "removeUserFromGroup, changeGroupName, changeGroupAvatar, blockUser, findUser, "
+                    "getUserInfo, setMute, pinConversations, addQuickMessage... "
+                    "args = mảng tham số theo đúng signature zca-js; ThreadType: 0=User, 1=Group. "
+                    "Vd: method=changeGroupName, args=[\"Tên mới\", \"<group_id>\"]."),
+                "parameters": {"type": "object", "properties": {
+                    "method": {"type": "string", "description": "Tên method zca-js"},
+                    "args": {"type": "array", "items": {}, "description": "Mảng tham số theo signature zca-js"}},
+                    "required": ["method"]}}},
+            handler=_zalo_api_call_handler, description="Gọi method zca-js bất kỳ (owner-only).", emoji="🧰")
         logger.info(
             "[zalo-personal] registered tools: core (send/scan/marketing/"
-            "friend/dm/media/sticker/persona/file-gen)"
+            "friend/dm/media/sticker/persona/file-gen) + zca passthrough "
+            "(poll/note/reminder/board/friend-accept/read-image/api-call)"
         )
     except Exception as e:
         logger.warning(f"[zalo-personal] tool registration failed: {e}")

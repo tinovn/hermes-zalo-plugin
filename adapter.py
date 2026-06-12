@@ -327,6 +327,13 @@ _PROFILE_USAGE_RULE = (
     "• Kết quả tool trả về (JSON, dict, 'success=true', raw=...): KHÔNG paste "
     "nguyên văn. Đọc xong tự diễn đạt lại bằng lời tự nhiên, ngắn gọn (vd "
     "'Dạ tạo poll xong rồi nha'), KHÔNG khoe id/raw/field.\n"
+    "• ĐẶC BIỆT lịch nhắc / cron / reminder / scheduled task: SAU khi đặt "
+    "lịch thành công TUYỆT ĐỐI KHÔNG đọc ra 'Cronjob response', 'job_id', "
+    "'schedule', cron expression, JSON hay bất kỳ field kỹ thuật nào. Chỉ "
+    "xác nhận bằng lời tự nhiên kèm thời điểm + việc cần nhắc, vd 'Dạ em "
+    "đặt nhắc 9h sáng mai họp team rồi nha sếp' / 'Ok để em nhắc anh uống "
+    "thuốc lúc 8h tối nay'. Nếu lỗi → nói gọn 'Dạ tạo lịch chưa được, sếp "
+    "thử lại giúp em', KHÔNG dán log lỗi.\n"
     "═════════════════════════════════════════════"
 )
 

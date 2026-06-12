@@ -2742,9 +2742,18 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
             "options=[...], multi_choice?, anonymous?, expires_hours?)\n"
             "   • \"ghi chú lại ...\", \"tạo note nhóm\" → zalo_create_note("
             "title, pin?)\n"
-            "   • \"nhắc nhóm họp 9h sáng mai\", \"tạo reminder\" → "
-            "zalo_create_reminder(title, at='YYYY-MM-DD HH:MM' hoặc "
-            "in_minutes=N, repeat=daily/weekly/monthly?)\n"
+            "   • Nhắc hẹn / lịch nhắc / reminder — PHÂN BIỆT 2 LOẠI:\n"
+            "     ▸ MẶC ĐỊNH (\"nhắc tao 9h họp\", \"đặt lịch nhắc uống "
+            "thuốc 8h tối\", \"tạo reminder mai gọi khách\") → dùng cron "
+            "của Hermes (cron tool), KHÔNG dùng zalo_create_reminder. "
+            "Cron sẽ tự bắn tin nhắc về home channel khi tới giờ.\n"
+            "     ▸ CHỈ khi sếp NÓI RÕ \"zalo\" (vd \"tạo nhắc hẹn TRÊN "
+            "ZALO\", \"đặt reminder Zalo cho nhóm\", \"tạo lịch hẹn Zalo\") "
+            "→ zalo_create_reminder(title, at='YYYY-MM-DD HH:MM' hoặc "
+            "in_minutes=N, repeat=daily/weekly/monthly?). Đây là nhắc hẹn "
+            "NATIVE hiện trên bảng tin Zalo.\n"
+            "     ▸ Không chắc loại nào → mặc định cron Hermes, đừng tạo "
+            "reminder Zalo nếu sếp không nhắc tới Zalo.\n"
             "   • Xem/sửa bảng tin: zalo_board_action(action=list → liệt kê "
             "note/poll/reminder kèm id; poll_detail/poll_lock/poll_vote; "
             "note_edit; reminder_remove)\n\n"
@@ -8826,9 +8835,11 @@ def _register_zalo_tools(ctx) -> None:
             schema={"type": "function", "function": {
                 "name": "zalo_create_reminder",
                 "description": (
-                    "Tạo NHẮC HẸN Zalo trong chat hiện tại (1-1 hoặc nhóm). Dùng khi sếp nói "
-                    "'nhắc cả nhóm họp lúc 9h', 'tạo reminder ...'. Thời gian: at='YYYY-MM-DD HH:MM' "
-                    "hoặc in_minutes=N phút nữa."),
+                    "Tạo NHẮC HẸN NATIVE trên Zalo (hiện ở bảng tin chat 1-1 hoặc nhóm). "
+                    "CHỈ dùng khi sếp NÓI RÕ chữ 'zalo' (vd 'tạo nhắc hẹn trên Zalo', "
+                    "'đặt reminder Zalo cho nhóm'). Lịch nhắc thông thường ('nhắc tao 9h họp', "
+                    "'tạo reminder mai gọi khách') KHÔNG dùng tool này — dùng cron của Hermes. "
+                    "Thời gian: at='YYYY-MM-DD HH:MM' hoặc in_minutes=N phút nữa."),
                 "parameters": {"type": "object", "properties": {
                     "title": {"type": "string", "description": "Nội dung nhắc"},
                     "chat_id": {"type": "string", "description": "Thread ID (bỏ trống = chat hiện tại)"},

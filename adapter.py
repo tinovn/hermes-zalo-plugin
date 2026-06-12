@@ -214,6 +214,45 @@ def _scrub_outgoing(text: str) -> Optional[str]:
     return t
 
 
+# ---------------------------------------------------------------------------
+# Cron / reminder delivery envelope stripper.
+#
+# When a Hermes cron/reminder job FIRES, core delivers the body wrapped in a
+# technical envelope, e.g.:
+#
+#     Cronjob Response: Nhắc đánh pick
+#     (job_id: 90d5be72fd33)
+#     -------------
+#
+#     Anh ơi tới giờ đánh pick rồi nha 🏓
+#
+#     To stop or manage this job, send me a new message (e.g. "stop reminder Nhắc đánh pick").
+#
+# End users should only ever see the natural-language body. We strip the header
+# (everything up to and including the dashed separator) and the management
+# footer. Applied to ALL outbound text — the home channel is the owner DM, which
+# send() otherwise passes through unscrubbed, so this is the only place the
+# envelope gets cleaned.
+# ---------------------------------------------------------------------------
+_CRON_HEADER_RE = re.compile(
+    r"^\s*Cron(?:job)?\s+Response\s*:.*?\n\s*-{3,}\s*\n",
+    re.IGNORECASE | re.DOTALL,
+)
+_CRON_FOOTER_RE = re.compile(
+    r"\n+\s*To stop or manage this job\b.*$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _strip_cron_envelope(text: str) -> str:
+    """Remove the Hermes cron/reminder delivery envelope, keep only the body."""
+    if not text or ("Response" not in text and "job_id" not in text):
+        return text
+    t = _CRON_HEADER_RE.sub("", text, count=1)
+    t = _CRON_FOOTER_RE.sub("", t)
+    return t.strip()
+
+
 # ── Cấu hình danh tính chủ tài khoản (tùy chọn, để TRỐNG cho bản chia sẻ) ──
 # ZALO_OWNER_NAME      : tên thật cần che khi bot lỡ nhắc (vd "Nguyễn Văn A")
 # ZALO_OWNER_NICKNAME  : cách xưng hô thay thế (mặc định "sếp")
@@ -2393,6 +2432,15 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Send text message qua sidecar /send/text."""
         if not content or not content.strip():
+            return SendResult(success=False, error="empty content")
+
+        # Cron/reminder jobs fire with a technical envelope (Cronjob Response /
+        # job_id / dashed separator / "To stop or manage this job" footer).
+        # Strip it FIRST so only the natural-language body reaches Zalo — this
+        # runs for the owner DM too (the cron home channel), which the scrub
+        # filters below deliberately skip.
+        content = _strip_cron_envelope(content)
+        if not content.strip():
             return SendResult(success=False, error="empty content")
 
         # Phản hồi thật đã tới → huỷ hẹn-giờ báo-chậm (nếu có) cho chat này.

@@ -1624,6 +1624,13 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
             # need quote bubbles since the conversation context is obvious.
             reply_to_message_id=message_id if is_group else None,
         )
+        # Báo "đang soạn tin…" cho khách ngay khi đã quyết định trả lời, để họ
+        # biết bot đã thấy tin và đang xử lý (Zalo tự tắt khi tin trả lời gửi
+        # đi hoặc sau vài giây). Best-effort — lỗi typing không chặn luồng.
+        try:
+            await self.send_typing(thread_id, metadata={"thread_type": thread_type})
+        except Exception as e:
+            logger.debug(f"[zalo-personal] send_typing on inbound failed: {e}")
         await self.handle_message(msg_event)
 
     async def _transcribe_voice(self, audio_path: str) -> Optional[str]:

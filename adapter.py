@@ -255,6 +255,33 @@ def _strip_cron_envelope(text: str) -> str:
     return t.strip()
 
 
+_FILE_MUTATION_FOOTER_RE = re.compile(
+    r"\n*⚠️\s*File-mutation verifier:.*?(?=\n\n\S|\Z)",
+    re.IGNORECASE | re.DOTALL,
+)
+_SELF_IMPROVEMENT_REVIEW_RE = re.compile(
+    r"^\s*💾\s*Self-improvement review\s*:.*$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _strip_non_owner_internal_noise(text: str) -> str:
+    """Remove owner/debug-only Hermes diagnostics from non-owner Zalo replies.
+
+    Owner DM remains untouched. For normal users/groups we keep the natural
+    assistant answer, but strip internal footers like the file-mutation verifier.
+    Standalone background-review notices are dropped silently instead of being
+    converted into a scary technical/error message.
+    """
+    if not text:
+        return text
+    t = text.strip()
+    if _SELF_IMPROVEMENT_REVIEW_RE.match(t):
+        return ""
+    t = _FILE_MUTATION_FOOTER_RE.sub("", text).strip()
+    return t
+
+
 # ── Cấu hình danh tính chủ tài khoản (tùy chọn, để TRỐNG cho bản chia sẻ) ──
 # ZALO_OWNER_NAME      : tên thật cần che khi bot lỡ nhắc (vd "Nguyễn Văn A")
 # ZALO_OWNER_NICKNAME  : cách xưng hô thay thế (mặc định "sếp")
@@ -2469,6 +2496,12 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
         # (groups, non-owner DMs) gets BOTH the scrubbed-status filter AND
         # the leak-scrub filter that strips IPs, OS info, paths, etc.
         if not self._is_owner_dm(chat_id):
+            content = _strip_non_owner_internal_noise(content)
+            if not content.strip():
+                logger.debug(
+                    f"[zalo-personal] internal owner-only notice dropped (chat={chat_id})"
+                )
+                return SendResult(success=True, raw_response={"dropped": "owner_only_internal_notice"})
             scrubbed = _scrub_outgoing(content)
             if scrubbed is None:
                 # Lỗi/nội bộ với user thường: KHÔNG im lặng, nhắn nhẹ trấn an.
@@ -5692,6 +5725,80 @@ def _zalo_send_pdf_handler(args: Any = None, **kwargs) -> Dict[str, Any]:
     return _finalise_file_send(ctx, "zalo_send_pdf")
 
 
+def _detect_image_ext(data: bytes) -> Optional[str]:
+    """Validate real image via magic bytes. Return an extension (.png/.jpg/
+    .gif/.webp) or None if the bytes are not a recognised image."""
+    if len(data) < 12:
+        return None
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return ".png"
+    if data[:3] == b"\xff\xd8\xff":
+        return ".jpg"
+    if data[:4] in (b"GIF8", b"GIF9") or data[:6] in (b"GIF87a", b"GIF89a"):
+        return ".gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return ".webp"
+    return None
+
+
+def _zalo_send_image_handler(args: Any = None, **kwargs) -> Dict[str, Any]:
+    """Decode a base64 image and send it as a REAL photo into the Zalo chat.
+    Same rate-limit/plumbing as the other zalo_send_* file tools. Non-owner OK.
+    The agent MUST call this instead of pasting the raw base64 string into a
+    text message (mã QR từ tao_qr, ảnh từ ve_anh, ...)."""
+    import base64 as _base64
+
+    p = _extract_tool_params(args, kwargs)
+    image_b64 = _coerce_str_arg(p.get("image_base64", ""))
+    if not image_b64.strip():
+        return {
+            "success": False,
+            "error": "Thiếu image_base64. Truyền chuỗi ảnh base64 (QR/ảnh) vào tham số này.",
+        }
+
+    # Strip optional data URI prefix: data:image/png;base64,....
+    raw_b64 = image_b64.strip()
+    if raw_b64.startswith("data:"):
+        comma = raw_b64.find(",")
+        if comma != -1:
+            raw_b64 = raw_b64[comma + 1:]
+    # Remove whitespace/newlines that models sometimes insert.
+    raw_b64 = re.sub(r"\s+", "", raw_b64)
+
+    try:
+        data = _base64.b64decode(raw_b64, validate=False)
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"Chuỗi base64 không hợp lệ, không decode được ({e}).",
+        }
+    if not data:
+        return {"success": False, "error": "Ảnh rỗng sau khi decode base64."}
+    if len(data) > 10_485_760:
+        return {"success": False, "error": "Ảnh quá lớn (>10MB), không gửi được."}
+
+    ext = _detect_image_ext(data)
+    if ext is None:
+        return {
+            "success": False,
+            "error": (
+                "Dữ liệu không phải ảnh hợp lệ (chỉ nhận PNG/JPEG/GIF/WebP). "
+                "Kiểm tra lại chuỗi base64 nguồn."
+            ),
+        }
+
+    ctx = _prepare_file_send(args, kwargs, required_ext=ext, default_stem="image")
+    if not ctx.get("ok"):
+        return {"success": False, "error": ctx.get("error")}
+    try:
+        ctx["out_path"].write_bytes(data)
+    except Exception as e:
+        return {"success": False, "error": f"file write failed: {e}"}
+    return _finalise_file_send(
+        ctx, "zalo_send_image", extra={"size_bytes": len(data)}
+    )
+
+
 def _zalo_send_pptx_handler(args: Any = None, **kwargs) -> Dict[str, Any]:
     """Build a .pptx from a spec (slides list) and send it. Non-owner OK.
 
@@ -8590,6 +8697,46 @@ def _register_zalo_tools(ctx) -> None:
             handler=_zalo_send_xlsx_handler,
             description="Generate XLSX from spec and send into a Zalo chat.",
             emoji="📈",
+        )
+        ctx.register_tool(
+            name="zalo_send_image",
+            toolset="hermes-zalo",
+            schema={
+                "type": "function",
+                "function": {
+                    "name": "zalo_send_image",
+                    "description": (
+                        "Gửi ẢNH cho khách từ dữ liệu base64 (mã QR từ "
+                        "tao_qr, ảnh từ ve_anh). BẮT BUỘC dùng khi có ảnh "
+                        "base64 — TUYỆT ĐỐI KHÔNG dán chuỗi base64 vào tin "
+                        "nhắn."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "image_base64": {
+                                "type": "string",
+                                "description": (
+                                    "Chuỗi ảnh base64 (có/không tiền tố "
+                                    "`data:image/...;base64,`). PNG/JPEG/GIF/WebP."
+                                ),
+                            },
+                            "caption": {
+                                "type": "string",
+                                "description": "Chú thích kèm ảnh (tuỳ chọn).",
+                            },
+                            "chat_id": {
+                                "type": "string",
+                                "description": "Chat/group ID. Bỏ trống = gửi chat hiện tại.",
+                            },
+                        },
+                        "required": ["image_base64"],
+                    },
+                },
+            },
+            handler=_zalo_send_image_handler,
+            description="Decode a base64 image and send it as a photo into a Zalo chat.",
+            emoji="🖼️",
         )
         ctx.register_tool(
             name="zalo_set_chat_persona",

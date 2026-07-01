@@ -206,6 +206,8 @@ def _scrub_outgoing(text: str) -> Optional[str]:
         return None
     # Mild brand redaction. Keep the message structure but swap names.
     t = _BRAND_REDACT_RE.sub("trợ lý", t)
+    # Ẩn thương hiệu backend: mọi biến thể "HostBill" → "Tino".
+    t = re.sub(r"(?i)host\s*-?\s*bill", "Tino", t)
     # Che tên chủ tài khoản (TÙY CHỌN): nếu khai báo ZALO_OWNER_NAME, thay
     # mọi biến thể tên đó bằng cách xưng hô (ZALO_OWNER_NICKNAME, mặc định
     # "sếp"). Mặc định KHÔNG khai báo → không che gì.
@@ -258,6 +260,11 @@ def _strip_cron_envelope(text: str) -> str:
 # ZALO_OWNER_NICKNAME  : cách xưng hô thay thế (mặc định "sếp")
 # Nếu không khai báo tên → plugin không che danh tính nào.
 _OWNER_NICKNAME = (os.getenv("ZALO_OWNER_NICKNAME") or "sếp").strip()
+# Câu trấn an gửi cho NGƯỜI DÙNG THƯỜNG khi hệ thống trục trặc (thay vì lộ
+# lỗi kỹ thuật hoặc im lặng). Owner (sếp) vẫn nhận đầy đủ chi tiết để xử lý.
+_USER_SOFT_ERROR_NOTICE = (
+    "Anh/chị chờ em chút để em kiểm tra lại nha, em báo lại ngay ạ 🙏"
+)
 _OWNER_NAME = (os.getenv("ZALO_OWNER_NAME") or "").strip()
 
 
@@ -684,7 +691,7 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
 
     # ── Lifecycle ──────────────────────────────────────────────────────────
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Spawn sidecar if needed, connect WebSocket, listen for messages."""
         if not self.owner_uid:
             logger.error("[zalo-personal] ZALO_PERSONAL_OWNER_UID required")
@@ -2464,11 +2471,13 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
         if not self._is_owner_dm(chat_id):
             scrubbed = _scrub_outgoing(content)
             if scrubbed is None:
+                # Lỗi/nội bộ với user thường: KHÔNG im lặng, nhắn nhẹ trấn an.
                 logger.debug(
-                    f"[zalo-personal] suppressed noisy status (chat={chat_id})"
+                    f"[zalo-personal] noisy status -> soft notice (chat={chat_id})"
                 )
-                return SendResult(success=True, message_id="suppressed")
-            content = _scrub_leak(scrubbed)
+                content = _USER_SOFT_ERROR_NOTICE
+            else:
+                content = _scrub_leak(scrubbed)
 
         # If the message is too long, split into chunks and send sequentially.
         # Only the FIRST chunk attaches the quote (reply_to); subsequent

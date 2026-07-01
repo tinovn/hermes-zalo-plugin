@@ -452,6 +452,21 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
 
         extra = getattr(config, "extra", {}) or {}
 
+        # ── Debounce tin nhắn đến (gom 2-3 tin gửi liên tiếp → 1 lượt trả lời) ──
+        # Khi khách gửi nhiều tin TEXT thuần cùng thread trong khoảng im lặng
+        # ngắn, gom text lại rồi mới đẩy 1 MessageEvent cho agent — tránh trả
+        # lời tách rời từng tin. Chỉ áp cho tin text (media/ảnh xử lý ngay).
+        # Window có thể chỉnh qua env ZALO_PERSONAL_INBOUND_DEBOUNCE_SECONDS.
+        try:
+            self._inbound_debounce_seconds = float(
+                os.getenv("ZALO_PERSONAL_INBOUND_DEBOUNCE_SECONDS") or 3.0
+            )
+        except (TypeError, ValueError):
+            self._inbound_debounce_seconds = 3.0
+        # per-thread: {thread_id: {"event": MessageEvent, "texts": [str],
+        #              "task": asyncio.Task}}
+        self._inbound_debounce: Dict[str, Dict[str, Any]] = {}
+
         self.sidecar_port = int(os.getenv("ZALO_PERSONAL_SIDECAR_PORT") or extra.get("sidecar_port", 3838))
         self.sidecar_url = f"http://127.0.0.1:{self.sidecar_port}"
         self.ws_url = f"ws://127.0.0.1:{self.sidecar_port}/events"
@@ -1665,7 +1680,56 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
             await self.send_typing(thread_id, metadata={"thread_type": thread_type})
         except Exception as e:
             logger.debug(f"[zalo-personal] send_typing on inbound failed: {e}")
-        await self.handle_message(msg_event)
+
+        # Gom tin text thuần gửi liên tiếp trước khi đẩy cho agent. Tin có
+        # media (ảnh/voice) hoặc khi debounce tắt → xử lý ngay như cũ.
+        is_plain_text = bool((text or "").strip()) and not media_urls
+        if self._inbound_debounce_seconds > 0 and is_plain_text:
+            await self._debounce_inbound(thread_id, msg_event, text or "")
+        else:
+            await self._flush_inbound_debounce(thread_id)  # giữ thứ tự nếu có buffer
+            await self.handle_message(msg_event)
+
+    async def _debounce_inbound(self, thread_id: str, msg_event, text: str) -> None:
+        """Buffer tin text theo thread; reset timer mỗi khi có tin mới. Hết
+        khoảng im lặng mới gom text (newline-join) rồi đẩy 1 lượt cho agent."""
+        st = self._inbound_debounce.get(thread_id)
+        if st and st.get("task") and not st["task"].done():
+            st["task"].cancel()
+        if not st:
+            st = {"event": msg_event, "texts": []}
+            self._inbound_debounce[thread_id] = st
+        # Luôn dùng event MỚI NHẤT (giữ message_id/quote mới) nhưng gộp text.
+        st["event"] = msg_event
+        st["texts"].append(text)
+        st["task"] = asyncio.ensure_future(self._debounce_timer(thread_id))
+
+    async def _debounce_timer(self, thread_id: str) -> None:
+        try:
+            await asyncio.sleep(self._inbound_debounce_seconds)
+        except asyncio.CancelledError:
+            return
+        await self._flush_inbound_debounce(thread_id)
+
+    async def _flush_inbound_debounce(self, thread_id: str) -> None:
+        """Đẩy buffer (nếu có) cho agent: gộp text các tin đã gom."""
+        st = self._inbound_debounce.pop(thread_id, None)
+        if not st:
+            return
+        task = st.get("task")
+        if task and not task.done():
+            task.cancel()
+        event = st["event"]
+        texts = [t for t in st["texts"] if t and t.strip()]
+        if len(texts) > 1:
+            try:
+                event.text = "\n".join(texts)
+            except Exception:
+                pass
+        try:
+            await self.handle_message(event)
+        except Exception as e:
+            logger.warning(f"[zalo-personal] flush debounce lỗi: {e}")
 
     async def _transcribe_voice(self, audio_path: str) -> Optional[str]:
         """Run Hermes STT on a local audio file. Returns transcript or None."""
@@ -3338,6 +3402,7 @@ _NON_OWNER_ALLOWED_TOOLS: set = {
     "translate", "sympy", "calculator",
     "zalo_group_summary",
     "zalo_send_html", "zalo_send_pptx", "zalo_send_pdf", "zalo_send_xlsx",
+    "zalo_send_image",
     "zalo_escalate_to_owner",
     # Đọc ảnh gần nhất: an toàn — handler ÉP scope vào chat hiện tại của
     # task (không peek chat khác), chỉ trả path ảnh đã cache của chính chat đó.
@@ -3625,6 +3690,17 @@ def _zalo_pre_tool_call_hook(
     _tname = (tool_name or "").lower().strip()
     _base = _tname.split(".")[-1] if "." in _tname else _tname
     _is_zalo_tool = _base.startswith("zalo_")
+
+    # Tool GỬI ra cho khách (ảnh/file) an toàn — cho phép LUÔN, kể cả khi
+    # session chưa resolve được. Gửi QR/ảnh/tài liệu cho khách không phải
+    # hành động nhạy cảm cần owner; chặn chúng làm hỏng UX (bot không gửi
+    # được ảnh QR/hoá đơn cho khách).
+    _SAFE_SEND = {
+        "zalo_send_image", "zalo_send_pdf", "zalo_send_xlsx",
+        "zalo_send_html", "zalo_send_pptx", "zalo_send_sticker",
+    }
+    if _base in _SAFE_SEND:
+        return None
 
     sess_record = None
     if session_id:

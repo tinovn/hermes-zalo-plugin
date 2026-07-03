@@ -1716,8 +1716,11 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
         st = self._inbound_debounce.pop(thread_id, None)
         if not st:
             return
+        # Flush thường được gọi từ chính _debounce_timer — không được cancel
+        # current task, nếu không CancelledError nuốt luôn handle_message bên dưới.
         task = st.get("task")
-        if task and not task.done():
+        current = asyncio.current_task()
+        if task and task is not current and not task.done():
             task.cancel()
         event = st["event"]
         texts = [t for t in st["texts"] if t and t.strip()]

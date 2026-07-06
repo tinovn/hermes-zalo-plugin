@@ -3501,6 +3501,14 @@ _NON_OWNER_ALLOWED_TOOLS: set = {
     # Đọc ảnh gần nhất: an toàn — handler ÉP scope vào chat hiện tại của
     # task (không peek chat khác), chỉ trả path ảnh đã cache của chính chat đó.
     "zalo_read_recent_image",
+    # Tino MCP office/* — tao tai lieu (auth=False, render thuan, KHONG dung
+    # HostBill billing/account). Cho non-owner de khach tu tao hop dong/bao gia.
+    "mcp_tino_tao_hop_dong", "mcp_tino_tao_docx", "mcp_tino_tao_pdf",
+    "mcp_tino_tao_bao_gia", "mcp_tino_tao_excel", "mcp_tino_tao_pptx",
+    "mcp_tino_tao_van_ban", "mcp_tino_ve_anh",
+    # Phong khi tool name o dang co dau cham -> base_name rut gon con "tao_*".
+    "tao_hop_dong", "tao_docx", "tao_pdf", "tao_bao_gia",
+    "tao_excel", "tao_pptx", "tao_van_ban", "ve_anh",
 }
 
 # Rate limit cho các tool gửi file (chống spam).

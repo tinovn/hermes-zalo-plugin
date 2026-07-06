@@ -51,6 +51,9 @@ _NOISY_STATUS_RE = re.compile(
     r"|auxiliary\s+.+\s+failed"
     r"|no\s+auxiliary\s+llm\s+provider"
     r"|auto-lowered\s+compression"
+    r"|auto-?compaction\s+was\s+raised"
+    r"|caps\s+context\s+at"
+    r"|compression\.\w*autoraise"
     r"|invalid\s+responses"
     r"|trying\s+fallback"
     r"|home\s+channel\s+is\s+set"
@@ -263,6 +266,17 @@ _SELF_IMPROVEMENT_REVIEW_RE = re.compile(
     r"^\s*💾\s*Self-improvement review\s*:.*$",
     re.IGNORECASE | re.DOTALL,
 )
+# Thông báo 1 lần của core khi gpt-5.5/Codex nâng ngưỡng auto-compaction
+# ("ℹ ... caps context at 272K, so auto-compaction was raised to 85% ...
+# Opt back out: hermes config set compression..."). Thuần thông tin vận
+# hành — KHÔNG được để lọt ra người dùng Zalo. Strip cả khối notice; nếu
+# tin chỉ gồm notice → rỗng → send() drop im lặng (owner DM vẫn giữ).
+_COMPRESSION_AUTORAISE_RE = re.compile(
+    r"(?:^|\n)[ \t]*ℹ?[^\n]*"
+    r"(?:caps context at|auto[- ]?compaction was raised)"
+    r"[^\n]*(?:\n[ \t]*[^\n]+)*",
+    re.IGNORECASE,
+)
 
 
 def _strip_non_owner_internal_noise(text: str) -> str:
@@ -278,7 +292,8 @@ def _strip_non_owner_internal_noise(text: str) -> str:
     t = text.strip()
     if _SELF_IMPROVEMENT_REVIEW_RE.match(t):
         return ""
-    t = _FILE_MUTATION_FOOTER_RE.sub("", text).strip()
+    t = _FILE_MUTATION_FOOTER_RE.sub("", text)
+    t = _COMPRESSION_AUTORAISE_RE.sub("", t).strip()
     return t
 
 

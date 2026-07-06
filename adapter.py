@@ -354,6 +354,42 @@ _MKT_CLIENT = None
 _LAST_MENTIONS: Dict[str, List[str]] = {}
 # Đường dẫn file ảnh sếp (owner) vừa gửi cho bot (để nhắn marketing kèm ảnh
 # "mấy ảnh em vừa gửi"). Giữ tối đa 10 ảnh gần nhất.
+# ── Tino-hosted media images (QR chuyển khoản / invoice) ──
+# get_payment_qr / addfunds_qr (MCP tino) trả QR dưới dạng *link* tới file PNG
+# host sẵn (https://mcp.tino.vn/media/<key>.png), KHÔNG phải MCP ImageContent
+# block — nên auto "ImageContent -> MEDIA:" của Hermes không kích hoạt, bot đành
+# dán link thô. Ta chặn các link ảnh tino ở outbound và gửi thành ảnh native.
+_TINO_MEDIA_IMG_RE = re.compile(
+    'https?://(?:[\\w.-]+\\.)?tino\\.vn/media/[\\w./-]+?\\.(?:png|jpe?g|webp|gif)(?:\\?[^\\s]*)?',
+    re.IGNORECASE,
+)
+
+
+def _extract_tino_media_images(text: str) -> List[str]:
+    """De-duplicated, order-preserving list of Tino media image URLs."""
+    if not text or "tino.vn/media/" not in text.lower():
+        return []
+    seen: set = set()
+    out: List[str] = []
+    for m in _TINO_MEDIA_IMG_RE.finditer(text):
+        url = m.group(0).rstrip(".,;)")
+        if url not in seen:
+            seen.add(url)
+            out.append(url)
+    return out
+
+
+def _strip_media_urls(text: str, urls: List[str]) -> str:
+    """Remove *urls* + dangling markdown wrappers, tidy whitespace."""
+    cleaned = text
+    for url in urls:
+        cleaned = cleaned.replace(url, "")
+    cleaned = re.sub(r"!?\[[^\]]*\]\(\s*\)", "", cleaned)
+    cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
 _LAST_OWNER_IMAGES: List[str] = []
 # Ảnh GẦN NHẤT theo từng chat (MỌI người gửi, không chỉ owner) → tool
 # zalo_read_recent_image cho bot "đọc" lại ảnh khi được hỏi "hình vừa gửi
@@ -2553,6 +2589,46 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
+        """Outbound entry. Deliver Tino-hosted QR/invoice image links as
+        native Zalo photos, then send the remaining text unchanged. The MCP
+        tino payment tools return an image *link* in text (not an MCP
+        ImageContent block), so without this the bot just pastes the URL."""
+        qr_images = _extract_tino_media_images(content) if content else []
+        if qr_images:
+            content = _strip_media_urls(content, qr_images)
+        text_result: Optional[SendResult] = None
+        if content and content.strip():
+            text_result = await self._send_text_impl(
+                chat_id, content, reply_to=reply_to, metadata=metadata
+            )
+        img_result: Optional[SendResult] = None
+        for _url in qr_images:
+            try:
+                img_result = await self.send_image(
+                    chat_id, _url, metadata=metadata
+                )
+                if not img_result.success:
+                    logger.warning(
+                        f"[zalo-personal] tino QR image send failed "
+                        f"({img_result.error}) url={_url}"
+                    )
+            except Exception as e:
+                logger.warning(
+                    f"[zalo-personal] tino QR image send exception: {e} url={_url}"
+                )
+        if text_result is not None:
+            return text_result
+        if img_result is not None:
+            return img_result
+        return SendResult(success=False, error="empty content")
+
+    async def _send_text_impl(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
         """Send text message qua sidecar /send/text."""
         if not content or not content.strip():
             return SendResult(success=False, error="empty content")
@@ -3420,7 +3496,7 @@ _NON_OWNER_ALLOWED_TOOLS: set = {
     "translate", "sympy", "calculator",
     "zalo_group_summary",
     "zalo_send_html", "zalo_send_pptx", "zalo_send_pdf", "zalo_send_xlsx",
-    "zalo_send_image",
+    "zalo_send_image", "zalo_send_file",
     "zalo_escalate_to_owner",
     # Đọc ảnh gần nhất: an toàn — handler ÉP scope vào chat hiện tại của
     # task (không peek chat khác), chỉ trả path ảnh đã cache của chính chat đó.
@@ -3673,6 +3749,8 @@ def _resolve_session_user_id(session_id: str) -> Optional[str]:
     except Exception:
         return None
     for key, sess in sjson.items():
+        if not isinstance(sess, dict):
+            continue  # bo qua entry sentinel khong phai session (vd key "_README")
         if sess.get("session_id") == session_id:
             origin = sess.get("origin") or {}
             return str(origin.get("user_id") or "")
@@ -3716,6 +3794,7 @@ def _zalo_pre_tool_call_hook(
     _SAFE_SEND = {
         "zalo_send_image", "zalo_send_pdf", "zalo_send_xlsx",
         "zalo_send_html", "zalo_send_pptx", "zalo_send_sticker",
+        "zalo_send_file",
     }
     if _base in _SAFE_SEND:
         return None
@@ -3726,6 +3805,8 @@ def _zalo_pre_tool_call_hook(
             with open(_hermes_home() / "sessions" / "sessions.json", encoding="utf-8") as f:
                 sjson = json.load(f)
             for sess in sjson.values():
+                if not isinstance(sess, dict):
+                    continue  # bỏ qua entry sentinel không phải session (vd key "_README")
                 if sess.get("session_id") == session_id:
                     sess_record = sess
                     break
@@ -4923,6 +5004,8 @@ def _resolve_current_chat_id_from_task(task_id: str) -> str:
     except Exception:
         return ""
     for sess in sjson.values():
+        if not isinstance(sess, dict):
+            continue  # bỏ qua entry sentinel không phải session (vd key "_README")
         if (
             sess.get("platform") == "zalo-personal"
             and sess.get("session_id") == task_id
@@ -5783,6 +5866,107 @@ def _zalo_send_html_handler(args: Any = None, **kwargs) -> Dict[str, Any]:
     except Exception as e:
         return {"success": False, "error": f"file write failed: {e}"}
     return _finalise_file_send(ctx, "zalo_send_html")
+
+
+# ── Gửi file bất kỳ CÓ SẴN (URL/local) vào Zalo ───────────────────────────
+# Lấp tool còn thiếu: các zalo_send_* khác đều RENDER nội dung (html→pdf,
+# spec→pptx/xlsx, base64→image). Khi agent ĐÃ có sẵn 1 file/URL (vd .docx do
+# MCP tino tạo tại https://mcp.tino.vn/media/...), trước đây không tool nào đẩy
+# được nên bot đành dán link tải. zalo_send_file lấp đúng khoảng trống đó.
+_SEND_FILE_MAX_BYTES = 50 * 1024 * 1024  # 50MB — khớp trần media của sidecar
+
+
+def _is_safe_public_url(url: str) -> Optional[str]:
+    """Trả chuỗi lỗi nếu URL KHÔNG an toàn để tải server-side (sai scheme, hoặc
+    host phân giải về IP nội bộ/loopback → chống SSRF vào service nội bộ như
+    mgmt:9997, rag:9998, dashboard:9119). Trả None nếu an toàn."""
+    try:
+        from urllib.parse import urlparse
+        import socket
+        import ipaddress
+        u = urlparse(url)
+        if u.scheme not in ("http", "https"):
+            return "URL phải bắt đầu bằng http:// hoặc https://."
+        host = u.hostname
+        if not host:
+            return "URL không hợp lệ (thiếu host)."
+        port = u.port or (443 if u.scheme == "https" else 80)
+        for info in socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP):
+            ip = ipaddress.ip_address(info[4][0])
+            if (ip.is_private or ip.is_loopback or ip.is_link_local
+                    or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+                return "URL trỏ tới địa chỉ nội bộ — từ chối để chống SSRF."
+        return None
+    except Exception as e:
+        return f"Không kiểm tra được URL ({e})."
+
+
+def _download_url_capped(url: str, max_bytes: int = _SEND_FILE_MAX_BYTES):
+    """Tải tối đa max_bytes+1 byte để phát hiện vượt trần. Trả (data, err)."""
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Hermes/1.0"})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            data = r.read(max_bytes + 1)
+    except Exception as e:
+        return None, f"Tải file thất bại: {e}"
+    if not data:
+        return None, "Tải file về rỗng (0 byte)."
+    if len(data) > max_bytes:
+        return None, f"File quá lớn (>{max_bytes // (1024 * 1024)}MB), không gửi được."
+    return data, None
+
+
+def _zalo_send_file_handler(args: Any = None, **kwargs) -> Dict[str, Any]:
+    """Gửi MỘT file có sẵn vào chat Zalo — nhận 'url' công khai hoặc 'file_path'
+    local. KHÔNG render (render dùng zalo_send_pdf/xlsx/pptx). Cùng rate-limit &
+    plumbing như các zalo_send_* khác; người ngoài owner cũng gọi được."""
+    from urllib.parse import urlparse
+
+    p = _extract_tool_params(args, kwargs)
+    url = _coerce_str_arg(p.get("url", "") or p.get("file_url", ""))
+    file_path = _coerce_str_arg(p.get("file_path", ""))
+    filename = _coerce_str_arg(p.get("filename", ""))
+
+    if not url and not file_path:
+        return {
+            "success": False,
+            "error": "Thiếu 'url' (hoặc 'file_path'). Truyền URL công khai của file cần gửi.",
+        }
+
+    if url:
+        guard = _is_safe_public_url(url)
+        if guard:
+            return {"success": False, "error": guard}
+        data, err = _download_url_capped(url)
+        if err:
+            return {"success": False, "error": err}
+        src_name = filename or os.path.basename(urlparse(url).path) or "document"
+    else:
+        try:
+            pth = Path(file_path)
+            if not pth.exists() or not pth.is_file():
+                return {"success": False, "error": f"file không tồn tại: {file_path}"}
+            if pth.stat().st_size > _SEND_FILE_MAX_BYTES:
+                return {"success": False, "error": "File quá lớn (>50MB), không gửi được."}
+            data = pth.read_bytes()
+        except Exception as e:
+            return {"success": False, "error": f"đọc file local thất bại: {e}"}
+        src_name = filename or Path(file_path).name
+
+    ext = os.path.splitext(src_name)[1].lower() or ".bin"
+
+    # Tái dùng prep chung (resolve chat_id, quota, thread_type, upload path).
+    # Ép filename đã suy ra vào params để giữ tên gốc + đúng đuôi.
+    merged = dict(p)
+    merged["filename"] = src_name
+    ctx = _prepare_file_send(merged, kwargs, required_ext=ext, default_stem="document")
+    if not ctx.get("ok"):
+        return {"success": False, "error": ctx.get("error")}
+    try:
+        ctx["out_path"].write_bytes(data)
+    except Exception as e:
+        return {"success": False, "error": f"file write failed: {e}"}
+    return _finalise_file_send(ctx, "zalo_send_file", extra={"size_bytes": len(data)})
 
 
 def _zalo_send_pdf_handler(args: Any = None, **kwargs) -> Dict[str, Any]:
@@ -8662,6 +8846,56 @@ def _register_zalo_tools(ctx) -> None:
             handler=_zalo_send_pdf_handler,
             description="Render HTML to PDF and send into a Zalo chat.",
             emoji="📕",
+        )
+        ctx.register_tool(
+            name="zalo_send_file",
+            toolset="hermes-zalo",
+            schema={
+                "type": "function",
+                "function": {
+                    "name": "zalo_send_file",
+                    "description": (
+                        "GỬI THẲNG một file CÓ SẴN vào chat Zalo (docx, doc, "
+                        "zip, txt, csv, mp3, ...). Nhận 'url' công khai (vd "
+                        "file do công cụ MCP tino tạo: "
+                        "https://mcp.tino.vn/media/....docx) HOẶC 'file_path' "
+                        "local trên server. Dùng khi ĐÃ có sẵn file/URL — "
+                        "TUYỆT ĐỐI KHÔNG dán link tải cho khách, BẮT BUỘC gọi "
+                        "tool này để đẩy file vào Zalo. Cần RENDER mới thì dùng "
+                        "zalo_send_pdf/xlsx/pptx. Người ngoài owner gọi được "
+                        "(rate limit 10/giờ/chat, 5/giờ/người)."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "url": {
+                                "type": "string",
+                                "description": "URL công khai http/https của file cần gửi.",
+                            },
+                            "file_path": {
+                                "type": "string",
+                                "description": "Đường dẫn file local trên server (thay cho url).",
+                            },
+                            "filename": {
+                                "type": "string",
+                                "description": "Tên file hiển thị (giữ đuôi, vd HD-Tino.docx). Bỏ trống = suy từ url.",
+                            },
+                            "chat_id": {
+                                "type": "string",
+                                "description": "Chat/group ID. Bỏ trống = gửi chat hiện tại.",
+                            },
+                            "caption": {
+                                "type": "string",
+                                "description": "Caption kèm file (tuỳ chọn).",
+                            },
+                        },
+                        "required": [],
+                    },
+                },
+            },
+            handler=_zalo_send_file_handler,
+            description="Send an existing file (by URL or local path) into a Zalo chat.",
+            emoji="📎",
         )
         ctx.register_tool(
             name="zalo_send_pptx",

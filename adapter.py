@@ -3500,7 +3500,7 @@ _NON_OWNER_ALLOWED_TOOLS: set = {
     "zalo_escalate_to_owner",
     # Đọc ảnh gần nhất: an toàn — handler ÉP scope vào chat hiện tại của
     # task (không peek chat khác), chỉ trả path ảnh đã cache của chính chat đó.
-    "zalo_read_recent_image",
+    "zalo_read_recent_image", "zalo_recent_image_base64",
     # Tino MCP office/* — tao tai lieu (auth=False, render thuan, KHONG dung
     # HostBill billing/account). Cho non-owner de khach tu tao hop dong/bao gia.
     "mcp_tino_tao_hop_dong", "mcp_tino_tao_docx", "mcp_tino_tao_pdf",
@@ -7382,6 +7382,75 @@ def _zalo_read_recent_image_handler(args: Any = None, **kwargs) -> Dict[str, Any
             "hint": "Gọi vision_analyze với từng path để đọc nội dung ảnh, rồi trả lời người dùng."}
 
 
+def _zalo_recent_image_base64_handler(args: Any = None, **kwargs) -> Dict[str, Any]:
+    """Đọc ảnh gần nhất trong chat hiện tại và trả data URI base64 cho MCP landing.
+
+    Bảo mật: chỉ resolve chat hiện tại từ task, không nhận chat_id do model truyền.
+    """
+    import base64 as _b64
+
+    p = _extract_tool_params(args, kwargs)
+    chat_id = _resolve_current_chat_id_from_task(_coerce_str_arg(kwargs.get("task_id", "")))
+    if not chat_id:
+        return {"success": False, "error": "không xác định được chat hiện tại"}
+
+    imgs = _LAST_THREAD_IMAGES.get(str(chat_id)) or []
+    try:
+        n = max(1, min(int(p.get("count") or 1), 5))
+    except (TypeError, ValueError):
+        n = 1
+
+    max_bytes = 6 * 1024 * 1024  # khớp giới hạn landing_upload_image
+    out: List[Dict[str, Any]] = []
+    for rec in reversed(imgs[-n:] if imgs else []):
+        path = str(rec.get("path") or "")
+        try:
+            if not path or not Path(path).exists():
+                continue
+            data = Path(path).read_bytes()
+        except Exception:
+            continue
+
+        ext = _detect_image_ext(data)
+        if ext is None:
+            continue
+        if len(data) > max_bytes:
+            out.append({
+                "error": "Ảnh quá lớn (>6MB), nhờ khách gửi ảnh nhẹ hơn.",
+                "from": rec.get("from_name") or rec.get("from_uid") or "",
+            })
+            continue
+
+        mime = {
+            ".png": "image/png",
+            ".jpg": "image/jpeg",
+            ".gif": "image/gif",
+            ".webp": "image/webp",
+        }.get(ext, "image/jpeg")
+        out.append({
+            "image_base64": "data:%s;base64,%s" % (mime, _b64.b64encode(data).decode()),
+            "from": rec.get("from_name") or rec.get("from_uid") or "",
+            "caption": rec.get("caption") or "",
+        })
+
+    if not out:
+        return {
+            "success": False,
+            "error": (
+                "Chưa có ảnh nào trong chat này (bot chỉ nhớ ảnh từ lúc chạy, giữ 5 ảnh gần nhất). "
+                "Nhờ khách gửi lại ảnh dạng ẢNH (không phải File/tài liệu)."
+            ),
+        }
+    return {
+        "success": True,
+        "images": out,
+        "hint": (
+            "Đưa image_base64 vào MCP landing_upload_image(slug, image_base64=...) "
+            "→ lấy URL trả về làm hero_image/gallery rồi landing_build/landing_update."
+        ),
+    }
+
+
 def _zalo_api_call_handler(args: Any = None, **kwargs) -> Dict[str, Any]:
     """CHỈ owner: gọi trực tiếp BẤT KỲ method zca-js nào qua sidecar.
 
@@ -9439,6 +9508,19 @@ def _register_zalo_tools(ctx) -> None:
                 "parameters": {"type": "object", "properties": {
                     "count": {"type": "integer", "description": "Số ảnh gần nhất cần lấy (1-5, mặc định 1)"}}}}},
             handler=_zalo_read_recent_image_handler, description="Lấy ảnh gần nhất trong chat để đọc.", emoji="🖼")
+        ctx.register_tool(
+            name="zalo_recent_image_base64", toolset="hermes-zalo",
+            schema={"type": "function", "function": {
+                "name": "zalo_recent_image_base64",
+                "description": (
+                    "Lấy ẢNH GẦN NHẤT khách gửi trong chat HIỆN TẠI dưới dạng BASE64 "
+                    "(data URI) để đưa vào MCP landing_upload_image(image_base64=...). "
+                    "DÙNG KHI khách gửi ảnh qua Zalo và cần gắn lên landing (banner/hero/gallery). "
+                    "Ảnh Zalo là FILE trên máy, KHÔNG phải URL — tool này đọc file → base64."),
+                "parameters": {"type": "object", "properties": {
+                    "count": {"type": "integer", "description": "Số ảnh gần nhất cần lấy (1-5, mặc định 1)"}}}}},
+            handler=_zalo_recent_image_base64_handler,
+            description="Lấy ảnh gần nhất (base64) để up lên landing.", emoji="🖼")
         ctx.register_tool(
             name="zalo_api_call", toolset="hermes-zalo",
             schema={"type": "function", "function": {

@@ -195,10 +195,26 @@ class LandingMediaBridge:
         resp = self._post(self._cfg.url, headers, body) or {}
         image_url = _extract_image_url(resp)
         if not image_url:
-            raise BridgeError("upload failed: no image_url in response")
+            # Surface the MCP's own error so the agent can self-correct (e.g. a
+            # wrong slug returns not_found — hiding it behind a generic message
+            # left the agent guessing). Never include the key or the payload.
+            err = _extract_error_message(resp)
+            raise BridgeError(f"upload rejected: {err}" if err
+                              else "upload failed: no image_url in response")
         if not _is_durable_asset_url(image_url):
             raise BridgeError("upload returned a non-durable URL")
         return image_url
+
+
+def _extract_error_message(resp: Dict[str, Any]) -> str:
+    """Pull a short human error out of an MCP error response ({error, message})."""
+    if not isinstance(resp, dict):
+        return ""
+    msg = resp.get("message") or resp.get("error") or ""
+    result = resp.get("result")
+    if not msg and isinstance(result, dict):
+        msg = result.get("message") or result.get("error") or ""
+    return str(msg)[:300]
 
 
 def _extract_image_url(resp: Dict[str, Any]) -> str:

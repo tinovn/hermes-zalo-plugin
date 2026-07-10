@@ -7645,11 +7645,19 @@ def _zalo_upload_recent_image_to_landing_handler(args: Any = None, **kwargs) -> 
             slug=slug, filename=filename, count=count,
         )
     except _LandingBridgeError as e:
-        return {
-            "success": False,
-            "error": str(e),
-            "hint": "Nhờ khách gửi lại ảnh dạng ẢNH (không phải File), rồi thử lại.",
-        }
+        err = str(e)
+        # Targeted hints so the agent self-corrects instead of blaming the photo:
+        # a rejected upload usually means WRONG SLUG (agent invented one from the
+        # image content) or an ownership problem — not a broken image.
+        if "upload rejected" in err or "not_found" in err or "hội thoại khác" in err:
+            hint = ("Slug có thể SAI hoặc landing không thuộc hội thoại này. Gọi "
+                    "mcp_tino_landing_list để lấy đúng slug landing của hội thoại, "
+                    "rồi gọi lại tool này với slug đó. KHÔNG tự bịa slug từ nội dung ảnh.")
+        elif "no recent image" in err:
+            hint = "Nhờ khách gửi lại ảnh dạng ẢNH (không phải File), rồi thử lại."
+        else:
+            hint = "Thử lại; nếu vẫn lỗi, nhờ khách gửi lại ảnh dạng ẢNH (không phải File)."
+        return {"success": False, "error": err, "hint": hint}
     except Exception:
         logger.warning("[zalo-personal] landing bridge upload crashed", exc_info=True)
         return {"success": False, "error": "upload lỗi nội bộ, thử lại sau."}
@@ -9731,7 +9739,9 @@ def _register_zalo_tools(ctx) -> None:
                     "server-to-server — KHÔNG kéo base64 qua hội thoại. Sau khi có "
                     "images[n].image_url, gọi landing_update(slug, data={...}) để gắn ảnh."),
                 "parameters": {"type": "object", "properties": {
-                    "slug": {"type": "string", "description": "Slug landing đang làm (bắt buộc)"},
+                    "slug": {"type": "string", "description": (
+                        "Slug landing CÓ THẬT của hội thoại (từ landing_build trước đó hoặc "
+                        "mcp_tino_landing_list). TUYỆT ĐỐI không tự bịa slug từ nội dung ảnh.")},
                     "filename": {"type": "string", "description": "Tên gợi ý cho ảnh (tuỳ chọn)"},
                     "count": {"type": "integer", "description": "Số ảnh gần nhất cần up (1-5, mặc định 1)"}},
                     "required": ["slug"]}}},

@@ -154,6 +154,20 @@ class TestUploadRecent(unittest.TestCase):
         with self.assertRaises(BridgeError):
             b.upload_recent(task_id="s", slug="s")
 
+    def test_mcp_error_message_surfaced(self):
+        """A wrong slug (MCP not_found/forbidden) must surface the MCP's own
+        message so the agent can self-correct — not a generic no-image_url."""
+        p = self._img("x.jpg")
+        b = self._bridge(
+            [_Rec(p)],
+            {"chat_id": "c", "conv_id": "c"},
+            {"error": "not_found", "message": "landing 'ict-sai-gon' không tồn tại"},
+        )
+        with self.assertRaises(BridgeError) as cm:
+            b.upload_recent(task_id="s", slug="ict-sai-gon")
+        self.assertIn("upload rejected", str(cm.exception))
+        self.assertIn("không tồn tại", str(cm.exception))
+
     def test_rejects_non_durable_url(self):
         p = self._img("x.jpg")
         b = self._bridge(

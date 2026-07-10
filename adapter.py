@@ -9840,8 +9840,10 @@ def _register_zalo_tools(ctx) -> None:
                     "Đưa ẢNH GẦN NHẤT khách gửi trong chat HIỆN TẠI lên landing DEMO của "
                     "đúng hội thoại này, TRẢ VỀ image_url công khai. Dùng khi khách gửi ảnh "
                     "qua Zalo và cần gắn lên landing (hero/banner/gallery). Upload chạy nền "
-                    "server-to-server — KHÔNG kéo base64 qua hội thoại. Sau khi có "
-                    "images[n].image_url, gọi landing_update(slug, data={...}) để gắn ảnh."),
+                    "server-to-server — KHÔNG kéo base64 qua hội thoại. Ảnh được TỰ ĐỘNG "
+                    "thu nhỏ về tối đa 1024px trước khi upload (ảnh điện thoại cỡ lớn vẫn "
+                    "up được). Sau khi có images[n].image_url, gọi "
+                    "landing_update(slug, data={...}) để gắn ảnh."),
                 "parameters": {"type": "object", "properties": {
                     "slug": {"type": "string", "description": (
                         "Slug landing CÓ THẬT của hội thoại (từ landing_build trước đó hoặc "

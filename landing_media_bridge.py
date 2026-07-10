@@ -15,6 +15,11 @@ Security contract (see plan Phase 3):
   * Remote filenames are content-addressed (``<stem>-<sha256[:12]>.<ext>``) so a
     retry with identical bytes targets the same object and never overwrites a
     different newer image.
+  * Images are downscaled to ``BridgeConfig.max_dim`` (default 1024px longest
+    side, env override ``TINO_LANDING_IMAGE_MAX_DIM``) before upload — a phone
+    photo shrinks ~10-30x and no longer bounces off the 6MB server cap. The
+    resize is fail-open (see ``image_resize.py``): without Pillow the original
+    bytes are uploaded under the old 6MB rule.
   * The upload key is read from the environment only, never logged, and the HTTP
     caller must not follow redirects.
 
@@ -36,7 +41,16 @@ try:  # reuse the authoritative magic sniff (DRY with the inbound contract)
 except Exception:  # pragma: no cover - path-loaded in production
     from inbound_media import sniff_image_bytes, is_within_root
 
-MAX_IMAGE_BYTES = 6 * 1024 * 1024  # matches landing_upload_image server cap
+try:  # bounded downscale before upload (fail-open: original bytes on failure)
+    from .image_resize import MAX_DIMENSION_DEFAULT, resize_image_to_max_dim  # type: ignore
+except Exception:  # pragma: no cover - path-loaded in production
+    from image_resize import MAX_DIMENSION_DEFAULT, resize_image_to_max_dim
+
+MAX_IMAGE_BYTES = 6 * 1024 * 1024  # cap on the UPLOADED bytes (landing_upload_image server cap)
+# Cached originals may be read up to this size — the downscale step brings a
+# big phone photo under MAX_IMAGE_BYTES; without Pillow the old 6MB behavior
+# is re-imposed by the post-resize cap check in upload_recent().
+MAX_SOURCE_IMAGE_BYTES = 24 * 1024 * 1024
 _STEM_RE = re.compile(r"[^a-z0-9]+")
 
 
@@ -102,6 +116,7 @@ class BridgeConfig:
     url: str          # fixed HTTPS origin, e.g. https://mcp.tino.vn/tools/landing_upload_image
     key: str          # upload-only agent key (read from env, never logged)
     cache_dir: str
+    max_dim: int = MAX_DIMENSION_DEFAULT  # longest image side after downscale
 
 
 def load_bridge_config(env: Dict[str, str], cache_dir: str) -> BridgeConfig:
@@ -114,7 +129,18 @@ def load_bridge_config(env: Dict[str, str], cache_dir: str) -> BridgeConfig:
         raise BridgeError("bridge URL must be https")
     if "@" in url.split("//", 1)[-1].split("/", 1)[0]:
         raise BridgeError("bridge URL must not contain userinfo")
-    return BridgeConfig(url=url, key=key, cache_dir=cache_dir)
+    # Per-VPS override lives in env (plugin updates reset the git tree, so code
+    # edits don't survive) — out-of-range or non-numeric values fall back.
+    max_dim = MAX_DIMENSION_DEFAULT
+    raw_dim = str(env.get("TINO_LANDING_IMAGE_MAX_DIM") or "").strip()
+    if raw_dim:
+        try:
+            v = int(raw_dim)
+            if 16 <= v <= 8192:
+                max_dim = v
+        except ValueError:
+            pass
+    return BridgeConfig(url=url, key=key, cache_dir=cache_dir, max_dim=max_dim)
 
 
 # session_resolver(task_id) -> {"chat_id": str, "conv_id": str} | None
@@ -165,16 +191,32 @@ class LandingMediaBridge:
         images: List[Dict[str, Any]] = []
         for rec in recents:
             local_path = getattr(rec, "local_path", None) or (rec.get("local_path") if isinstance(rec, dict) else None)
-            data, mime, ext = read_cached_image(self._cfg.cache_dir, str(local_path or ""))
+            # Read up to the SOURCE cap, then downscale to max_dim (longest
+            # side). Digest/remote name are computed on the FINAL bytes so a
+            # retry of the same original still hits the same object.
+            data, mime, ext = read_cached_image(
+                self._cfg.cache_dir, str(local_path or ""),
+                max_bytes=MAX_SOURCE_IMAGE_BYTES,
+            )
+            rr = resize_image_to_max_dim(data, mime=mime, ext=ext, max_dim=self._cfg.max_dim)
+            data, mime, ext = rr.data, rr.mime, rr.ext
+            if len(data) > MAX_IMAGE_BYTES:
+                # Resize unavailable/failed (rr.reason) AND the original busts
+                # the server cap — same failure the pre-resize bridge gave.
+                raise BridgeError("image too large")
             digest = hashlib.sha256(data).hexdigest()
             remote_name = content_addressed_name(filename, digest, ext)
             image_url = self._upload_one(conv_id, slug, data, mime, remote_name)
-            images.append({
+            entry: Dict[str, Any] = {
                 "image_url": image_url,
                 "filename": remote_name,
                 "mime": mime,
                 "size": len(data),
-            })
+            }
+            if rr.width and rr.height:
+                entry["width"] = rr.width
+                entry["height"] = rr.height
+            images.append(entry)
         # Compact result; never returns sender, local path, chat id or base64.
         return {"slug": slug, "count": len(images), "images": images}
 

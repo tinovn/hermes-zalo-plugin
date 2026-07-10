@@ -279,6 +279,14 @@ _COMPRESSION_AUTORAISE_RE = re.compile(
 )
 
 
+# Dòng đuôi "Opt back out: hermes config set ..." của thông báo auto-compaction
+# hay bị TÁCH khỏi dòng đầu bởi 1 dòng trống → _COMPRESSION_AUTORAISE_RE bỏ
+# sót. Bắt riêng để strip (thuần vận hành, phải drop im lặng cho khách).
+_COMPRESSION_OPTOUT_RE = re.compile(
+    r"(?im)^[ \t]*Opt back out:[^\n]*hermes\s+config\s+set[^\n]*$"
+)
+
+
 def _strip_non_owner_internal_noise(text: str) -> str:
     """Remove owner/debug-only Hermes diagnostics from non-owner Zalo replies.
 
@@ -294,6 +302,7 @@ def _strip_non_owner_internal_noise(text: str) -> str:
         return ""
     t = _FILE_MUTATION_FOOTER_RE.sub("", text)
     t = _COMPRESSION_AUTORAISE_RE.sub("", t).strip()
+    t = _COMPRESSION_OPTOUT_RE.sub("", t).strip()
     return t
 
 

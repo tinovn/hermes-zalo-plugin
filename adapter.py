@@ -347,6 +347,54 @@ except Exception:  # pragma: no cover
     _mkt = _ilu.module_from_spec(_spec_mkt)
     _spec_mkt.loader.exec_module(_mkt)
 
+# Pure inbound-media contract helpers (magic sniff, path validation,
+# normalization, bounded recent-image index). Same load strategy as marketing.
+try:
+    from . import inbound_media as _inmedia  # type: ignore
+except Exception:  # pragma: no cover
+    import importlib.util as _ilu2
+    _imp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "inbound_media.py")
+    _spec_im = _ilu2.spec_from_file_location("zalo_inbound_media", _imp)
+    _inmedia = _ilu2.module_from_spec(_spec_im)
+    _spec_im.loader.exec_module(_inmedia)
+normalize_inbound_media = _inmedia.normalize_inbound_media
+resolve_media_cache_dir = _inmedia.resolve_media_cache_dir
+RecentImage = _inmedia.RecentImage
+RecentImageIndex = _inmedia.RecentImageIndex
+
+# Server-to-server Zalo→landing image bridge (no base64 through the LLM).
+try:
+    from . import landing_media_bridge as _lbridge  # type: ignore
+except Exception:  # pragma: no cover
+    import importlib.util as _ilu3
+    _lbp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "landing_media_bridge.py")
+    _spec_lb = _ilu3.spec_from_file_location("zalo_landing_media_bridge", _lbp)
+    _lbridge = _ilu3.module_from_spec(_spec_lb)
+    _spec_lb.loader.exec_module(_lbridge)
+_LandingMediaBridge = _lbridge.LandingMediaBridge
+_LandingBridgeError = _lbridge.BridgeError
+_load_landing_bridge_config = _lbridge.load_bridge_config
+
+# Segment-aware outbound classifier (hide lifecycle/context diagnostics, keep
+# the real answer) + bounded terminal-recovery limiter.
+try:
+    from . import message_filtering as _msgfilter  # type: ignore
+except Exception:  # pragma: no cover
+    import importlib.util as _ilu4
+    _mfp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "message_filtering.py")
+    _spec_mf = _ilu4.spec_from_file_location("zalo_message_filtering", _mfp)
+    _msgfilter = _ilu4.module_from_spec(_spec_mf)
+    _spec_mf.loader.exec_module(_msgfilter)
+_classify_outbound = _msgfilter.classify
+_FilterAction = _msgfilter.FilterAction
+_RECOVERY_LIMITER = _msgfilter.RecoveryNoticeLimiter(ttl=300.0, max_size=500)
+
+
+def _chat_hash(chat_id: Any) -> str:
+    """Short, non-reversible chat identifier for structured logs (never raw id)."""
+    import hashlib as _hl
+    return _hl.sha256(str(chat_id or "").encode("utf-8")).hexdigest()[:10]
+
 _MKT_STORE = None
 _MKT_CLIENT = None
 # uid người được @tag gần nhất theo từng chat (cho zalo_friend_add/send_dm
@@ -393,8 +441,33 @@ def _strip_media_urls(text: str, urls: List[str]) -> str:
 _LAST_OWNER_IMAGES: List[str] = []
 # Ảnh GẦN NHẤT theo từng chat (MỌI người gửi, không chỉ owner) → tool
 # zalo_read_recent_image cho bot "đọc" lại ảnh khi được hỏi "hình vừa gửi
-# nói gì". Mỗi chat giữ 5 ảnh gần nhất: {path, from_uid, from_name, ts, caption}.
-_LAST_THREAD_IMAGES: Dict[str, List[Dict[str, Any]]] = {}
+# nói gì". Bounded, namespaced theo (self_uid, chat_id); dedupe theo msg_id;
+# thứ tự theo (event_ts, ingress_seq) — KHÔNG theo thứ tự download hoàn tất.
+# Chỉ populate SAU authorization (không cho sender bị deny làm nhiễm cache).
+_RECENT_IMAGES = RecentImageIndex(per_chat=5, max_chats=200)
+
+
+def _capture_recent_image(event: Dict[str, Any], from_uid: str, local_path: str,
+                          mime_type: Optional[str]) -> None:
+    """Add an AUTHORIZED, magic-validated inbound image to the recent-image
+    index. Called only after authorization + system/synthetic gates, so a
+    denied sender or a Zalo system message can never poison the cache."""
+    try:
+        chat_id = str(event.get("thread_id") or from_uid)
+        seq = int(event.get("ingress_seq") or 0)
+        msg_id = str(event.get("msg_id") or f"{chat_id}:{seq}")
+        _RECENT_IMAGES.add(chat_id, RecentImage(
+            msg_id=msg_id,
+            local_path=str(local_path),
+            from_uid=str(from_uid),
+            from_name=str(event.get("from_name") or ""),
+            event_ts=float(event.get("ts") or 0),
+            ingress_seq=seq,
+            mime_type=mime_type,
+            caption="",
+        ))
+    except Exception:
+        logger.debug("[zalo-personal] recent-image capture failed", exc_info=True)
 # Cache giới tính theo uid (tra 1 lần qua sidecar getUserInfo) → bot xưng hô
 # "anh/chị" đúng thay vì phỏng đoán theo tên. value: "male"|"female"|"unknown".
 _USER_GENDER_CACHE: Dict[str, str] = {}
@@ -810,6 +883,28 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
 
         logger.info(f"[zalo-personal] sidecar connected, uid={health.get('uid')}")
         self._self_uid = str(health.get("uid") or "")
+        # Bind the recent-image index to this account; clears any stale images
+        # from a previously-connected account (hot reload / account change).
+        try:
+            _RECENT_IMAGES.set_account(self._self_uid)
+        except Exception:
+            logger.debug("[zalo-personal] recent-image set_account failed", exc_info=True)
+
+        # Fail closed if the sidecar's resolved media-cache root disagrees with
+        # the adapter's — otherwise valid local images get rejected as path
+        # escapes later. Both must resolve to the same directory.
+        try:
+            _sidecar_root = str(health.get("media_cache_dir") or "").rstrip("/")
+            _adapter_root = str(resolve_media_cache_dir()).rstrip("/")
+            if _sidecar_root and os.path.realpath(_sidecar_root) != os.path.realpath(_adapter_root):
+                logger.error(
+                    "[zalo-personal] media-cache root MISMATCH: sidecar=%s adapter=%s — "
+                    "set ZALO_PERSONAL_SESSION_DIR identically for both processes.",
+                    _sidecar_root, _adapter_root,
+                )
+                return False
+        except Exception:
+            logger.debug("[zalo-personal] media-cache root check failed", exc_info=True)
 
         try:
             import websockets  # noqa: F401
@@ -1208,32 +1303,10 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
                 _LAST_MENTIONS[str(event.get("thread_id") or "")] = _ment
         except Exception:
             pass
-        # Bắt ảnh SẾP (owner) gửi cho bot → dùng cho nhắn marketing kèm ảnh.
-        try:
-            _c = event.get("content") or {}
-            if (isinstance(_c, dict) and _c.get("kind") == "image" and _c.get("local_path")
-                    and self.owner_uid and str(from_uid) == str(self.owner_uid)):
-                _LAST_OWNER_IMAGES.append(str(_c["local_path"]))
-                del _LAST_OWNER_IMAGES[:-10]  # giữ 10 ảnh gần nhất
-                logger.warning(f"[zalo-mkt-diag] bắt ảnh owner: {_c['local_path']} (tổng {len(_LAST_OWNER_IMAGES)})")
-        except Exception:
-            pass
-        # Nhớ ảnh GẦN NHẤT theo chat (mọi người gửi) → zalo_read_recent_image
-        # cho phép bot đọc lại ảnh khi được hỏi sau đó.
-        try:
-            if isinstance(_c, dict) and _c.get("kind") == "image" and _c.get("local_path"):
-                _tid_img = str(event.get("thread_id") or from_uid)
-                _imgs = _LAST_THREAD_IMAGES.setdefault(_tid_img, [])
-                _imgs.append({
-                    "path": str(_c["local_path"]),
-                    "from_uid": from_uid,
-                    "from_name": str(event.get("from_name") or ""),
-                    "ts": event.get("ts") or 0,
-                    "caption": str(_c.get("title") or _c.get("caption") or ""),
-                })
-                del _imgs[:-5]  # giữ 5 ảnh gần nhất mỗi chat
-        except Exception:
-            pass
+        # LƯU Ý: việc bắt ảnh gần nhất (recent-image index + owner images) đã
+        # được CHUYỂN XUỐNG SAU authorization + system/synthetic filters
+        # (xem _maybe_capture_recent_image trong nhánh xử lý ảnh) để sender bị
+        # deny / tin hệ thống KHÔNG thể làm nhiễm cache dùng cho landing upload.
         # Bỏ qua tin HỆ THỐNG của Zalo (nhắc lịch/reminder, thông báo poll,
         # sự kiện nhóm...). Người gửi hiển thị là "Zalo" → KHÔNG phải người
         # thật; nếu xử lý, bot sẽ reply vào reminder và tưởng nhầm có "chị
@@ -1390,20 +1463,29 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
                 text = f"{text}\n[Link đính kèm: {href}]" if text else f"[Link: {href}]"
         elif kind == "image":
             text = (content.get("title") or "").strip()
-            local_path = content.get("local_path")
-            if local_path:
-                media_urls.append(str(local_path))
-                media_types.append("image")
+            # Validate the cached path is inside the media-cache root and confirm
+            # the bytes really are an image (magic). media_types carries the REAL
+            # MIME (image/jpeg…) so Hermes routes to native vision, not "image".
+            media = normalize_inbound_media(content, resolve_media_cache_dir())
+            if media.is_image and media.local_path:
+                media_urls.append(media.local_path)
+                media_types.append(media.mime_type or "")
                 message_type = MessageType.PHOTO
+                _capture_recent_image(event, from_uid, media.local_path, media.mime_type)
                 # Nếu CHÍNH SẾP (owner) gửi ảnh: nhắc agent rằng ảnh đã được
                 # lưu và có thể GỬI LẠI cho người khác — để agent biết dùng
                 # use_last_images=true (nếu không sẽ chỉ gửi text, thiếu ảnh).
                 if self.owner_uid and str(from_uid) == str(self.owner_uid):
+                    _LAST_OWNER_IMAGES.append(media.local_path)
+                    del _LAST_OWNER_IMAGES[:-10]  # giữ 10 ảnh gần nhất
                     text = (text + "\n\n[Hệ thống cho trợ lý: sếp vừa đính kèm 1 ảnh (đã lưu sẵn). "
                             "Nếu sếp muốn GỬI ẢNH NÀY cho ai đó, gọi zalo_send_dm (1 người) hoặc "
                             "zalo_marketing_send (nhiều người) với use_last_images=true — KHÔNG cần link ảnh.]").strip()
             else:
-                logger.warning(f"[zalo-personal] image msg without local_path: {content}")
+                logger.warning(
+                    "[zalo-personal] image msg without usable local image (reason=%s)",
+                    getattr(media, "reason", None),
+                )
                 text = text or "[ảnh không tải được]"
         elif kind == "voice":
             local_path = content.get("local_path")
@@ -1429,6 +1511,18 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
             elif content.get("too_large"):
                 text = f"[file '{fname}' quá lớn (>50MB) — không tải vì an toàn/hiệu năng]"
                 local_path = None
+            # Defense in depth: a photo delivered as a Zalo File (fileUrl) whose
+            # bytes are a real image is routed to vision, not treated as a
+            # document. (The sidecar already reclassifies; this also covers an
+            # older sidecar.)
+            _file_media = normalize_inbound_media(content, resolve_media_cache_dir()) if local_path else None
+            if _file_media is not None and _file_media.is_image and _file_media.local_path:
+                media_urls.append(_file_media.local_path)
+                media_types.append(_file_media.mime_type or "")
+                message_type = MessageType.PHOTO
+                _capture_recent_image(event, from_uid, _file_media.local_path, _file_media.mime_type)
+                text = (content.get("title") or content.get("caption") or "").strip()
+                local_path = None  # handled as image; skip the document branch
             if local_path:
                 media_urls.append(str(local_path))
                 media_types.append("file")
@@ -1479,10 +1573,17 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
         try:
             _q = event.get("quote") or {}
             _q_img = (_q.get("image") or {}) if isinstance(_q, dict) else {}
-            _q_path = str(_q_img.get("local_path") or "")
-            if _q_path and Path(_q_path).exists():
-                media_urls.append(_q_path)
-                media_types.append("image")
+            # Route the quoted image through the same validation contract as a
+            # direct image so it gets a real MIME and a root-checked local path.
+            _q_media = normalize_inbound_media(
+                {"kind": "image",
+                 "local_path": _q_img.get("local_path"),
+                 "mime_type": _q_img.get("mime_type")},
+                resolve_media_cache_dir(),
+            ) if isinstance(_q_img, dict) and _q_img.get("local_path") else None
+            if _q_media is not None and _q_media.is_image and _q_media.local_path:
+                media_urls.append(_q_media.local_path)
+                media_types.append(_q_media.mime_type or "")
                 if message_type == MessageType.TEXT:
                     message_type = MessageType.PHOTO
                 _q_note = (
@@ -2649,10 +2750,38 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
             _ack.cancel()
         self._slow_ack_fired.discard(_cid)
 
-        # The owner's DM is the operator's debug feed — pass status messages
-        # through untouched so they can audit the bot. Everywhere else
-        # (groups, non-owner DMs) gets BOTH the scrubbed-status filter AND
-        # the leak-scrub filter that strips IPs, OS info, paths, etc.
+        # ── Universal operational/terminal filter (ALL chats, incl. owner DM) ──
+        # Lifecycle/progress diagnostics (busy/interrupt, compaction) NEVER reach
+        # any chat; terminal failures collapse to ONE localized recovery notice
+        # per chat/category; a real answer next to a notice is preserved. Owner
+        # audit continues via structured logs, not chat spam.
+        _decision = _classify_outbound(content)
+        if _decision.action == _FilterAction.DROP_OPERATIONAL:
+            logger.info("[zalo-personal] dropped operational msg cats=%s chat_hash=%s",
+                        ",".join(_decision.categories), _chat_hash(chat_id))
+            return SendResult(success=True, raw_response={"dropped": "operational"})
+        if _decision.action == _FilterAction.REPLACE_TERMINAL:
+            _rk = "%s:%s:%s:%s" % (
+                self._self_uid or "?", _cid,
+                (metadata or {}).get("task_id") or (metadata or {}).get("correlation_id") or "",
+                _decision.recovery_key or "terminal",
+            )
+            if not _RECOVERY_LIMITER.should_emit(_rk, time.monotonic()):
+                logger.info("[zalo-personal] suppressed repeat terminal notice cat=%s chat_hash=%s",
+                            _decision.recovery_key, _chat_hash(chat_id))
+                return SendResult(success=True, raw_response={"dropped": "terminal_repeat"})
+            logger.warning("[zalo-personal] terminal failure → recovery notice cat=%s chat_hash=%s",
+                           _decision.recovery_key, _chat_hash(chat_id))
+            content = _decision.cleaned_text
+        else:
+            content = _decision.cleaned_text
+        if not content.strip():
+            return SendResult(success=True, raw_response={"dropped": "empty_after_filter"})
+
+        # Everywhere except owner DM additionally gets brand/leak redaction
+        # (IPs, OS info, paths, vendor names). Owner DM keeps real names for
+        # auditing but — unlike before — no longer bypasses the operational
+        # filter above.
         if not self._is_owner_dm(chat_id):
             content = _strip_non_owner_internal_noise(content)
             if not content.strip():
@@ -3245,18 +3374,18 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
         it matches a known-noisy pattern (retry attempts, provider warnings,
         sethome prompts, brand leaks, self-improvement reviews).
 
-        Owner DM is exempt — the operator wants to see everything for
-        auditing. Groups and non-owner DMs get the cleaned feed.
+        Lifecycle/progress status is dropped for EVERY chat (owner DM included —
+        owner audit is via structured logs, not chat bubbles). Anything that
+        survives is routed through ``send`` → ``_send_text_impl``, the single
+        final text choke point that re-applies the same classifier.
         """
-        if self._is_owner_dm(chat_id):
-            return await self.send(chat_id, content, metadata=metadata)
-        scrubbed = _scrub_outgoing(content)
-        if scrubbed is None:
-            logger.debug(
-                f"[zalo-personal] suppressed status key={status_key} chat={chat_id}"
-            )
+        decision = _classify_outbound(content)
+        if decision.action != _FilterAction.KEEP or not decision.cleaned_text.strip():
+            logger.debug("[zalo-personal] suppressed status key=%s chat_hash=%s cats=%s",
+                         status_key, _chat_hash(chat_id), ",".join(decision.categories))
             return SendResult(success=True, message_id=f"status:{status_key}:suppressed")
-        return await self.send(chat_id, scrubbed, metadata=metadata)
+        # Route through the choke point (never POST /send/text directly here).
+        return await self.send(chat_id, decision.cleaned_text, metadata=metadata)
 
     async def send_reaction(
         self,
@@ -3318,23 +3447,25 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
             return False
 
     async def _slow_ack_after(self, chat_id: str, delay: float = 8.0) -> None:
-        """Nhóm Cộng đồng Zalo KHÔNG hiện 'đang soạn'. Nếu sau `delay`s vẫn
-        chưa gửi phản hồi → gửi 1 tin báo ngắn để mọi người biết bot đang làm.
-        send() sẽ cancel task này khi phản hồi thật tới kịp (câu nhanh → im)."""
+        """P0: community slow-ACK TEXT bubble removed.
+
+        Previously this posted a fixed "đang xử lý…" text directly to
+        ``/send/text``, bypassing the outbound classifier and racing the final
+        answer (an ACK could land AFTER the real reply). We keep only a
+        best-effort typing indicator; no direct text send here.
+        """
         cid = str(chat_id)
         try:
             await asyncio.sleep(delay)
-            body = {"thread_id": cid,
-                    "thread_type": self._thread_types.get(cid, "group"),
-                    "text": "Em nhận rồi, đang xử lý ạ… chờ em chút xíu ⏳"}
+            body = {"thread_id": cid, "thread_type": self._thread_types.get(cid, "group")}
             await asyncio.get_event_loop().run_in_executor(
-                None, self._http_post_json, "/send/text", body)
+                None, self._http_post_json, "/typing", body)
             self._slow_ack_fired.add(cid)
-            logger.info(f"[zalo-personal] slow-ack sent to community chat={cid}")
+            logger.debug("[zalo-personal] slow-ack typing hint chat_hash=%s", _chat_hash(cid))
         except asyncio.CancelledError:
             pass
         except Exception as e:
-            logger.debug(f"[zalo-personal] slow-ack failed: {e}")
+            logger.debug(f"[zalo-personal] slow-ack typing failed: {e}")
         finally:
             self._slow_ack_tasks.pop(cid, None)
 
@@ -3500,7 +3631,10 @@ _NON_OWNER_ALLOWED_TOOLS: set = {
     "zalo_escalate_to_owner",
     # Đọc ảnh gần nhất: an toàn — handler ÉP scope vào chat hiện tại của
     # task (không peek chat khác), chỉ trả path ảnh đã cache của chính chat đó.
-    "zalo_read_recent_image", "zalo_recent_image_base64",
+    "zalo_read_recent_image",
+    # Upload ảnh Zalo gần nhất vào landing DEMO của đúng chat hiện tại,
+    # server-to-server (KHÔNG đưa base64 qua LLM). Thay cho zalo_recent_image_base64.
+    "zalo_upload_recent_image_to_landing",
     # Tino MCP office/* — tao tai lieu (auth=False, render thuan, KHONG dung
     # HostBill billing/account). Cho non-owner de khach tu tao hop dong/bao gia.
     "mcp_tino_tao_hop_dong", "mcp_tino_tao_docx", "mcp_tino_tao_pdf",
@@ -3860,6 +3994,15 @@ def _zalo_pre_tool_call_hook(
             "IP / OS / source code / config / env / paths / tools nội bộ."
         ),
     }
+
+    # ── OPEN_ALL_TINO_MCP — chủ tài khoản chủ động MỞ mọi tool mcp.tino.vn cho
+    # khách (non-owner). Owner xác nhận chấp nhận rủi ro; các thao tác nhạy cảm
+    # (billing/DNS/VPS/account) VẪN được MCP tino tự bảo vệ bằng phiên đăng nhập
+    # OTP riêng (tool auth=True cần conv_token/session) — cổng plugin mở không
+    # bỏ qua lớp OTP đó. shell/filesystem/git/zalo_api_call (không phải tool
+    # tino) VẪN khoá cho khách.
+    if tname.startswith("mcp_tino_") or base_name.startswith("mcp_tino_"):
+        return None
 
     if base_name in _NON_OWNER_ALLOWED_TOOLS:
         # zalo_group_summary được phép, NHƯNG non-owner chỉ được tóm tắt đúng
@@ -6027,6 +6170,45 @@ def _detect_image_ext(data: bytes) -> Optional[str]:
     return None
 
 
+def _image_bytes_look_complete(data: bytes, ext: str) -> bool:
+    """Best-effort truncation check for OUTBOUND images (send path).
+
+    Prefer a real Pillow decode when available; otherwise fall back to
+    container-terminator / declared-length checks so a half-downloaded image is
+    not sent as a broken photo. (Inbound uses magic-byte sniffing separately.)
+    """
+    try:
+        from io import BytesIO
+        from PIL import Image  # type: ignore
+
+        with Image.open(BytesIO(data)) as img:
+            img.verify()
+        with Image.open(BytesIO(data)) as img:
+            img.load()
+            return img.width > 0 and img.height > 0
+    except ImportError:
+        pass
+    except Exception:
+        return False
+
+    if ext == ".jpg":
+        trimmed = data.rstrip(b"\x00\r\n\t ")
+        return b"\xff\xda" in data and trimmed.endswith(b"\xff\xd9")
+    if ext == ".png":
+        return (
+            data.startswith(b"\x89PNG\r\n\x1a\n")
+            and data.endswith(b"\x00\x00\x00\x00IEND\xaeB`\x82")
+        )
+    if ext == ".gif":
+        return data[:6] in (b"GIF87a", b"GIF89a") and data.rstrip().endswith(b";")
+    if ext == ".webp":
+        if len(data) < 12 or data[:4] != b"RIFF" or data[8:12] != b"WEBP":
+            return False
+        declared = int.from_bytes(data[4:8], "little") + 8
+        return 12 <= declared <= len(data)
+    return False
+
+
 def _zalo_send_image_handler(args: Any = None, **kwargs) -> Dict[str, Any]:
     """Decode a base64 image and send it as a REAL photo into the Zalo chat.
     Same rate-limit/plumbing as the other zalo_send_* file tools. Non-owner OK.
@@ -6064,12 +6246,12 @@ def _zalo_send_image_handler(args: Any = None, **kwargs) -> Dict[str, Any]:
         return {"success": False, "error": "Ảnh quá lớn (>10MB), không gửi được."}
 
     ext = _detect_image_ext(data)
-    if ext is None:
+    if ext is None or not _image_bytes_look_complete(data, ext):
         return {
             "success": False,
             "error": (
-                "Dữ liệu không phải ảnh hợp lệ (chỉ nhận PNG/JPEG/GIF/WebP). "
-                "Kiểm tra lại chuỗi base64 nguồn."
+                "Dữ liệu không phải ảnh hợp lệ hoặc bị cắt dở (chỉ nhận "
+                "PNG/JPEG/GIF/WebP đầy đủ). Kiểm tra lại chuỗi base64 nguồn."
             ),
         }
 
@@ -7359,19 +7541,19 @@ def _zalo_read_recent_image_handler(args: Any = None, **kwargs) -> Dict[str, Any
     chat_id = _resolve_current_chat_id_from_task(_coerce_str_arg(kwargs.get("task_id", "")))
     if not chat_id:
         return {"success": False, "error": "không xác định được chat hiện tại"}
-    imgs = _LAST_THREAD_IMAGES.get(str(chat_id)) or []
     try:
         n = max(1, min(int(p.get("count") or 1), 5))
     except (TypeError, ValueError):
         n = 1
     out = []
-    for rec in reversed(imgs[-n:] if imgs else []):
+    # recent() returns oldest→newest; present newest first for the agent.
+    for rec in reversed(_RECENT_IMAGES.recent(chat_id, count=n)):
         try:
-            if Path(str(rec.get("path") or "")).exists():
+            if Path(str(rec.local_path or "")).exists():
                 out.append({
-                    "path": rec["path"],
-                    "from": rec.get("from_name") or rec.get("from_uid") or "",
-                    "caption": rec.get("caption") or "",
+                    "path": rec.local_path,
+                    "from": rec.from_name or rec.from_uid or "",
+                    "caption": rec.caption or "",
                 })
         except Exception:
             continue
@@ -7382,71 +7564,101 @@ def _zalo_read_recent_image_handler(args: Any = None, **kwargs) -> Dict[str, Any
             "hint": "Gọi vision_analyze với từng path để đọc nội dung ảnh, rồi trả lời người dùng."}
 
 
-def _zalo_recent_image_base64_handler(args: Any = None, **kwargs) -> Dict[str, Any]:
-    """Đọc ảnh gần nhất trong chat hiện tại và trả data URI base64 cho MCP landing.
+def _bridge_http_post(url: str, headers: Dict[str, str], body: Dict[str, Any]) -> Dict[str, Any]:
+    """POST JSON to the landing bridge with a bounded timeout and NO redirects.
 
-    Bảo mật: chỉ resolve chat hiện tại từ task, không nhận chat_id do model truyền.
+    A redirect could send the upload-only key to an attacker-controlled host, so
+    any 3xx is treated as failure.
     """
-    import base64 as _b64
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
 
-    p = _extract_tool_params(args, kwargs)
-    chat_id = _resolve_current_chat_id_from_task(_coerce_str_arg(kwargs.get("task_id", "")))
-    if not chat_id:
-        return {"success": False, "error": "không xác định được chat hiện tại"}
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *a, **k):  # noqa: D401 - block all redirects
+            return None
 
-    imgs = _LAST_THREAD_IMAGES.get(str(chat_id)) or []
+    opener = urllib.request.build_opener(_NoRedirect)
     try:
-        n = max(1, min(int(p.get("count") or 1), 5))
+        with opener.open(req, timeout=90) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        raise _LandingBridgeError(f"HTTP {e.code}") from None
+    except Exception as e:
+        raise _LandingBridgeError(f"transport error: {e.__class__.__name__}") from None
+    try:
+        return json.loads(raw) if raw else {}
+    except Exception:
+        raise _LandingBridgeError("invalid JSON response") from None
+
+
+def _bridge_session_resolver(task_id: str) -> Optional[Dict[str, str]]:
+    """Resolve the trusted current Zalo session record from task_id.
+
+    Returns ``chat_id`` (recent-image namespace) and ``conv_id`` (the Tino-MCP
+    conversation id used as X-Session). Hermes scopes tino landings by the Zalo
+    CHAT, so ``conv_id == chat_id`` — this makes the bridge's ownership check
+    identical to the agent's own landing_build/update, and lets a chat edit its
+    landing across Hermes session resets. Returns None on ambiguity (fail closed).
+    """
+    tid = _coerce_str_arg(task_id)
+    if not tid:
+        return None
+    try:
+        with open(_hermes_home() / "sessions" / "sessions.json", encoding="utf-8") as f:
+            sjson = json.load(f)
+    except Exception:
+        return None
+    for sess in sjson.values():
+        if not isinstance(sess, dict):
+            continue
+        if sess.get("platform") == "zalo-personal" and sess.get("session_id") == tid:
+            chat_id = str((sess.get("origin") or {}).get("chat_id") or "")
+            if chat_id:
+                return {"chat_id": chat_id, "conv_id": chat_id}
+    return None
+
+
+def _zalo_upload_recent_image_to_landing_handler(args: Any = None, **kwargs) -> Dict[str, Any]:
+    """Upload ảnh Zalo gần nhất của CHAT HIỆN TẠI vào landing (server-to-server).
+
+    Thay cho zalo_recent_image_base64: base64 KHÔNG bao giờ đi qua LLM. Chỉ nhận
+    slug (+ filename/count tuỳ chọn); chat/session lấy từ task_id tin cậy, không
+    nhận chat_id/path do model truyền.
+    """
+    p = _extract_tool_params(args, kwargs)
+    slug = _coerce_str_arg(p.get("slug", ""))
+    filename = _coerce_str_arg(p.get("filename", "")) or None
+    try:
+        count = max(1, min(int(p.get("count") or 1), 5))
     except (TypeError, ValueError):
-        n = 1
-
-    max_bytes = 6 * 1024 * 1024  # khớp giới hạn landing_upload_image
-    out: List[Dict[str, Any]] = []
-    for rec in reversed(imgs[-n:] if imgs else []):
-        path = str(rec.get("path") or "")
-        try:
-            if not path or not Path(path).exists():
-                continue
-            data = Path(path).read_bytes()
-        except Exception:
-            continue
-
-        ext = _detect_image_ext(data)
-        if ext is None:
-            continue
-        if len(data) > max_bytes:
-            out.append({
-                "error": "Ảnh quá lớn (>6MB), nhờ khách gửi ảnh nhẹ hơn.",
-                "from": rec.get("from_name") or rec.get("from_uid") or "",
-            })
-            continue
-
-        mime = {
-            ".png": "image/png",
-            ".jpg": "image/jpeg",
-            ".gif": "image/gif",
-            ".webp": "image/webp",
-        }.get(ext, "image/jpeg")
-        out.append({
-            "image_base64": "data:%s;base64,%s" % (mime, _b64.b64encode(data).decode()),
-            "from": rec.get("from_name") or rec.get("from_uid") or "",
-            "caption": rec.get("caption") or "",
-        })
-
-    if not out:
+        count = 1
+    try:
+        cfg = _load_landing_bridge_config(dict(os.environ), resolve_media_cache_dir())
+        bridge = _LandingMediaBridge(
+            cfg,
+            recent_fn=lambda chat_id, n: _RECENT_IMAGES.recent(chat_id, count=n),
+            session_resolver=_bridge_session_resolver,
+            http_post=_bridge_http_post,
+        )
+        result = bridge.upload_recent(
+            task_id=_coerce_str_arg(kwargs.get("task_id", "")),
+            slug=slug, filename=filename, count=count,
+        )
+    except _LandingBridgeError as e:
         return {
             "success": False,
-            "error": (
-                "Chưa có ảnh nào trong chat này (bot chỉ nhớ ảnh từ lúc chạy, giữ 5 ảnh gần nhất). "
-                "Nhờ khách gửi lại ảnh dạng ẢNH (không phải File/tài liệu)."
-            ),
+            "error": str(e),
+            "hint": "Nhờ khách gửi lại ảnh dạng ẢNH (không phải File), rồi thử lại.",
         }
+    except Exception:
+        logger.warning("[zalo-personal] landing bridge upload crashed", exc_info=True)
+        return {"success": False, "error": "upload lỗi nội bộ, thử lại sau."}
     return {
         "success": True,
-        "images": out,
+        **result,
         "hint": (
-            "Đưa image_base64 vào MCP landing_upload_image(slug, image_base64=...) "
-            "→ lấy URL trả về làm hero_image/gallery rồi landing_build/landing_update."
+            "Dùng images[n].image_url làm hero_image/gallery rồi gọi "
+            "landing_update(slug, data={...}). KHÔNG cần base64."
         ),
     }
 
@@ -9509,18 +9721,22 @@ def _register_zalo_tools(ctx) -> None:
                     "count": {"type": "integer", "description": "Số ảnh gần nhất cần lấy (1-5, mặc định 1)"}}}}},
             handler=_zalo_read_recent_image_handler, description="Lấy ảnh gần nhất trong chat để đọc.", emoji="🖼")
         ctx.register_tool(
-            name="zalo_recent_image_base64", toolset="hermes-zalo",
+            name="zalo_upload_recent_image_to_landing", toolset="hermes-zalo",
             schema={"type": "function", "function": {
-                "name": "zalo_recent_image_base64",
+                "name": "zalo_upload_recent_image_to_landing",
                 "description": (
-                    "Lấy ẢNH GẦN NHẤT khách gửi trong chat HIỆN TẠI dưới dạng BASE64 "
-                    "(data URI) để đưa vào MCP landing_upload_image(image_base64=...). "
-                    "DÙNG KHI khách gửi ảnh qua Zalo và cần gắn lên landing (banner/hero/gallery). "
-                    "Ảnh Zalo là FILE trên máy, KHÔNG phải URL — tool này đọc file → base64."),
+                    "Đưa ẢNH GẦN NHẤT khách gửi trong chat HIỆN TẠI lên landing DEMO của "
+                    "đúng hội thoại này, TRẢ VỀ image_url công khai. Dùng khi khách gửi ảnh "
+                    "qua Zalo và cần gắn lên landing (hero/banner/gallery). Upload chạy nền "
+                    "server-to-server — KHÔNG kéo base64 qua hội thoại. Sau khi có "
+                    "images[n].image_url, gọi landing_update(slug, data={...}) để gắn ảnh."),
                 "parameters": {"type": "object", "properties": {
-                    "count": {"type": "integer", "description": "Số ảnh gần nhất cần lấy (1-5, mặc định 1)"}}}}},
-            handler=_zalo_recent_image_base64_handler,
-            description="Lấy ảnh gần nhất (base64) để up lên landing.", emoji="🖼")
+                    "slug": {"type": "string", "description": "Slug landing đang làm (bắt buộc)"},
+                    "filename": {"type": "string", "description": "Tên gợi ý cho ảnh (tuỳ chọn)"},
+                    "count": {"type": "integer", "description": "Số ảnh gần nhất cần up (1-5, mặc định 1)"}},
+                    "required": ["slug"]}}},
+            handler=_zalo_upload_recent_image_to_landing_handler,
+            description="Up ảnh Zalo gần nhất lên landing (server-to-server, không base64).", emoji="🖼")
         ctx.register_tool(
             name="zalo_api_call", toolset="hermes-zalo",
             schema={"type": "function", "function": {

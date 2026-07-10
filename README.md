@@ -100,11 +100,43 @@ zalo-personal/
 ├── __init__.py          # entrypoint: from .adapter import register
 ├── adapter.py           # adapter Hermes (lifecycle, routing, tool, phễu marketing)
 ├── marketing.py         # logic phễu (store/quota/schedule/sheet) — test được độc lập
+├── inbound_media.py     # hợp đồng media inbound (magic sniff, normalize, recent-image index)
+├── landing_media_bridge.py # upload ảnh Zalo → landing server-to-server (không base64 qua LLM)
+├── message_filtering.py # classifier ẩn thông báo vận hành, giữ câu trả lời thật
 ├── plugin.yaml          # manifest + khai báo env
 ├── .env.example         # mẫu biến môi trường
+├── tests/               # unittest (stdlib) — chạy không cần Hermes/Zalo
 └── sidecar/
     ├── server.js        # sidecar Node.js (zca-js)
+    ├── media-contract.js # magic sniff + streaming download + cache-root resolver
     └── package.json     # deps Node
+```
+
+## Thông báo vận hành & khôi phục
+
+- Plugin KHÔNG hiển thị thông báo lifecycle/context của runtime ra chat Zalo
+  (busy/interrupt, "Context too large", "Context length exceeded", "Cannot
+  compress further"…) — kể cả owner DM. Chi tiết vẫn có trong **log server**
+  (category/counter, `chat_hash`), không log nội dung thô.
+- Lỗi kỹ thuật terminal → chỉ 1 câu trấn an tiếng Việt/chat/loại lỗi trong mỗi
+  cửa sổ TTL (không lặp, không đè chat khác).
+- Câu trả lời thật nằm cạnh thông báo kỹ thuật **được giữ nguyên** (classifier
+  bóc đúng đoạn notice, không nuốt cả tin).
+- Khi model không còn trả lời được: nhắn **`/new`** để mở phiên mới (cách khôi
+  phục chuẩn). Busy-ACK bubble tắt qua Hermes config (`display.busy_ack_enabled=false`)
+  ở bước deploy — không đổi ngữ nghĩa queue/interrupt của core.
+
+## Kiểm thử (tests)
+
+Không cần login Zalo hay boot Hermes — module thuần tách riêng để test.
+
+```bash
+# Python (adapter helpers)
+python3 -m unittest discover -s tests -v
+python3 -m compileall -q adapter.py marketing.py inbound_media.py
+
+# Node (sidecar media contract)
+cd sidecar && node --check server.js && node --test
 ```
 
 ## Giấy phép / miễn trừ

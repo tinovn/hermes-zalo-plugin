@@ -6,7 +6,8 @@
   "description": "Sidecar Node.js cầu nối Zalo Web API (zca-js) cho plugin Hermes Zalo cá nhân.",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node --test"
   },
   "engines": {
     "node": ">=18"

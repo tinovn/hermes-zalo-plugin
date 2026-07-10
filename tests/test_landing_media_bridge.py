@@ -123,7 +123,7 @@ class TestUploadRecent(unittest.TestCase):
         p = self._img("x.jpg")
         b = self._bridge(
             [_Rec(p)],
-            {"chat_id": "chatA", "session_id": "sess-1"},
+            {"chat_id": "chatA", "conv_id": "chatA"},
             {"image_url": "https://landingpage.tino.vn/my-slug/assets/hero-abc.jpg"},
         )
         out = b.upload_recent(task_id="sess-1", slug="my-slug", filename="hero")
@@ -135,9 +135,9 @@ class TestUploadRecent(unittest.TestCase):
         # never leak sender/local path/base64 in the returned metadata
         self.assertNotIn("local_path", img)
         self.assertNotIn("image_base64", img)
-        # the trusted session id was sent as X-Session, key never in body
+        # the trusted conv id (== chat id) is sent as X-Session; key never in body
         sent = self.posted[0]
-        self.assertEqual(sent["headers"]["X-Session"], "sess-1")
+        self.assertEqual(sent["headers"]["X-Session"], "chatA")
         self.assertEqual(sent["headers"]["X-Agent-Key"], "secret-key")
         self.assertNotIn("secret-key", str(sent["body"]))
         # content-addressed filename
@@ -150,7 +150,7 @@ class TestUploadRecent(unittest.TestCase):
             b.upload_recent(task_id="bad", slug="s")
 
     def test_fail_closed_when_no_recent_image(self):
-        b = self._bridge([], {"chat_id": "c", "session_id": "s"}, {})
+        b = self._bridge([], {"chat_id": "c", "conv_id": "c"}, {})
         with self.assertRaises(BridgeError):
             b.upload_recent(task_id="s", slug="s")
 
@@ -158,7 +158,7 @@ class TestUploadRecent(unittest.TestCase):
         p = self._img("x.jpg")
         b = self._bridge(
             [_Rec(p)],
-            {"chat_id": "c", "session_id": "s"},
+            {"chat_id": "c", "conv_id": "c"},
             {"image_url": "https://mcp.tino.vn/media/tmp123.jpg"},  # temporary transport
         )
         with self.assertRaises(BridgeError):
@@ -169,7 +169,7 @@ class TestUploadRecent(unittest.TestCase):
         p2 = self._img("b.jpg")  # identical bytes
         b = self._bridge(
             [_Rec(p1), _Rec(p2)],
-            {"chat_id": "c", "session_id": "s"},
+            {"chat_id": "c", "conv_id": "c"},
             {"image_url": "https://x/s/assets/n.jpg"},
         )
         b.upload_recent(task_id="s", slug="s", count=2)

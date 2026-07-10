@@ -7592,10 +7592,13 @@ def _bridge_http_post(url: str, headers: Dict[str, str], body: Dict[str, Any]) -
 
 
 def _bridge_session_resolver(task_id: str) -> Optional[Dict[str, str]]:
-    """Resolve the trusted current Zalo session record from task_id → chat + session.
+    """Resolve the trusted current Zalo session record from task_id.
 
-    task_id == session_id in this setup. Returns None on any ambiguity so the
-    bridge fails closed.
+    Returns ``chat_id`` (recent-image namespace) and ``conv_id`` (the Tino-MCP
+    conversation id used as X-Session). Hermes scopes tino landings by the Zalo
+    CHAT, so ``conv_id == chat_id`` — this makes the bridge's ownership check
+    identical to the agent's own landing_build/update, and lets a chat edit its
+    landing across Hermes session resets. Returns None on ambiguity (fail closed).
     """
     tid = _coerce_str_arg(task_id)
     if not tid:
@@ -7611,7 +7614,7 @@ def _bridge_session_resolver(task_id: str) -> Optional[Dict[str, str]]:
         if sess.get("platform") == "zalo-personal" and sess.get("session_id") == tid:
             chat_id = str((sess.get("origin") or {}).get("chat_id") or "")
             if chat_id:
-                return {"chat_id": chat_id, "session_id": tid}
+                return {"chat_id": chat_id, "conv_id": chat_id}
     return None
 
 

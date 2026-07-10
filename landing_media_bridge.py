@@ -117,7 +117,9 @@ def load_bridge_config(env: Dict[str, str], cache_dir: str) -> BridgeConfig:
     return BridgeConfig(url=url, key=key, cache_dir=cache_dir)
 
 
-# session_resolver(task_id) -> {"chat_id": str, "session_id": str} | None
+# session_resolver(task_id) -> {"chat_id": str, "conv_id": str} | None
+#   chat_id: authorized recent-image namespace selector
+#   conv_id: Tino-MCP conversation id (sent as X-Session); == chat_id here
 SessionResolver = Callable[[str], Optional[Dict[str, str]]]
 # recent_fn(chat_id, count) -> list of objects with .local_path / .from_name
 RecentFn = Callable[[str, int], List[Any]]
@@ -138,12 +140,18 @@ class LandingMediaBridge:
         slug = str(slug or "").strip()
         if not slug:
             raise BridgeError("slug required")
-        # Trusted identity: resolve chat + session from task_id ONLY.
+        # Trusted identity resolved from task_id ONLY (model cannot override):
+        #   chat_id  — selects the authorized recent-image namespace
+        #   conv_id  — the Tino-MCP conversation id sent as X-Session. In this
+        #              deployment Hermes scopes tino landings by the Zalo chat,
+        #              so conv_id == chat_id and ownership matches the agent's
+        #              own landing_build/update calls. (Verified: landing_list
+        #              returns a chat's demos only under X-Session = chat_id.)
         sess = self._resolve(str(task_id or ""))
-        if not sess or not sess.get("chat_id") or not sess.get("session_id"):
-            raise BridgeError("cannot resolve current chat/session")
+        if not sess or not sess.get("chat_id") or not sess.get("conv_id"):
+            raise BridgeError("cannot resolve current chat/conversation")
         chat_id = str(sess["chat_id"])
-        session_id = str(sess["session_id"])
+        conv_id = str(sess["conv_id"])
 
         try:
             n = max(1, min(int(count), 5))
@@ -160,7 +168,7 @@ class LandingMediaBridge:
             data, mime, ext = read_cached_image(self._cfg.cache_dir, str(local_path or ""))
             digest = hashlib.sha256(data).hexdigest()
             remote_name = content_addressed_name(filename, digest, ext)
-            image_url = self._upload_one(session_id, slug, data, mime, remote_name)
+            image_url = self._upload_one(conv_id, slug, data, mime, remote_name)
             images.append({
                 "image_url": image_url,
                 "filename": remote_name,
@@ -170,11 +178,11 @@ class LandingMediaBridge:
         # Compact result; never returns sender, local path, chat id or base64.
         return {"slug": slug, "count": len(images), "images": images}
 
-    def _upload_one(self, session_id: str, slug: str, data: bytes, mime: str, remote_name: str) -> str:
+    def _upload_one(self, conv_id: str, slug: str, data: bytes, mime: str, remote_name: str) -> str:
         import base64 as _b64
         headers = {
             "X-Agent-Key": self._cfg.key,
-            "X-Session": session_id,
+            "X-Session": conv_id,
             "Content-Type": "application/json",
         }
         body = {

@@ -3995,6 +3995,15 @@ def _zalo_pre_tool_call_hook(
         ),
     }
 
+    # ── OPEN_ALL_TINO_MCP — chủ tài khoản chủ động MỞ mọi tool mcp.tino.vn cho
+    # khách (non-owner). Owner xác nhận chấp nhận rủi ro; các thao tác nhạy cảm
+    # (billing/DNS/VPS/account) VẪN được MCP tino tự bảo vệ bằng phiên đăng nhập
+    # OTP riêng (tool auth=True cần conv_token/session) — cổng plugin mở không
+    # bỏ qua lớp OTP đó. shell/filesystem/git/zalo_api_call (không phải tool
+    # tino) VẪN khoá cho khách.
+    if tname.startswith("mcp_tino_") or base_name.startswith("mcp_tino_"):
+        return None
+
     if base_name in _NON_OWNER_ALLOWED_TOOLS:
         # zalo_group_summary được phép, NHƯNG non-owner chỉ được tóm tắt đúng
         # nhóm họ đang trò chuyện — không cho truy vấn group_id tuỳ ý (nếu
@@ -6161,6 +6170,45 @@ def _detect_image_ext(data: bytes) -> Optional[str]:
     return None
 
 
+def _image_bytes_look_complete(data: bytes, ext: str) -> bool:
+    """Best-effort truncation check for OUTBOUND images (send path).
+
+    Prefer a real Pillow decode when available; otherwise fall back to
+    container-terminator / declared-length checks so a half-downloaded image is
+    not sent as a broken photo. (Inbound uses magic-byte sniffing separately.)
+    """
+    try:
+        from io import BytesIO
+        from PIL import Image  # type: ignore
+
+        with Image.open(BytesIO(data)) as img:
+            img.verify()
+        with Image.open(BytesIO(data)) as img:
+            img.load()
+            return img.width > 0 and img.height > 0
+    except ImportError:
+        pass
+    except Exception:
+        return False
+
+    if ext == ".jpg":
+        trimmed = data.rstrip(b"\x00\r\n\t ")
+        return b"\xff\xda" in data and trimmed.endswith(b"\xff\xd9")
+    if ext == ".png":
+        return (
+            data.startswith(b"\x89PNG\r\n\x1a\n")
+            and data.endswith(b"\x00\x00\x00\x00IEND\xaeB`\x82")
+        )
+    if ext == ".gif":
+        return data[:6] in (b"GIF87a", b"GIF89a") and data.rstrip().endswith(b";")
+    if ext == ".webp":
+        if len(data) < 12 or data[:4] != b"RIFF" or data[8:12] != b"WEBP":
+            return False
+        declared = int.from_bytes(data[4:8], "little") + 8
+        return 12 <= declared <= len(data)
+    return False
+
+
 def _zalo_send_image_handler(args: Any = None, **kwargs) -> Dict[str, Any]:
     """Decode a base64 image and send it as a REAL photo into the Zalo chat.
     Same rate-limit/plumbing as the other zalo_send_* file tools. Non-owner OK.
@@ -6198,12 +6246,12 @@ def _zalo_send_image_handler(args: Any = None, **kwargs) -> Dict[str, Any]:
         return {"success": False, "error": "Ảnh quá lớn (>10MB), không gửi được."}
 
     ext = _detect_image_ext(data)
-    if ext is None:
+    if ext is None or not _image_bytes_look_complete(data, ext):
         return {
             "success": False,
             "error": (
-                "Dữ liệu không phải ảnh hợp lệ (chỉ nhận PNG/JPEG/GIF/WebP). "
-                "Kiểm tra lại chuỗi base64 nguồn."
+                "Dữ liệu không phải ảnh hợp lệ hoặc bị cắt dở (chỉ nhận "
+                "PNG/JPEG/GIF/WebP đầy đủ). Kiểm tra lại chuỗi base64 nguồn."
             ),
         }
 

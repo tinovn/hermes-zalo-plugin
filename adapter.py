@@ -395,6 +395,16 @@ def _chat_hash(chat_id: Any) -> str:
     import hashlib as _hl
     return _hl.sha256(str(chat_id or "").encode("utf-8")).hexdigest()[:10]
 
+
+def _persona_notice(key: str, default: str) -> str:
+    """Canned notice theo persona (bot_persona.json → notices{key}), fallback
+    câu mặc định. Dùng cho các dòng đi thẳng ra khách KHÔNG qua LLM — để bot
+    xưng hô đúng giọng persona (vd Ông Bụt: ta/con) thay vì em/anh chị cứng."""
+    try:
+        return _msgfilter.resolve_notice(_load_bot_persona(), key, default)
+    except Exception:
+        return default
+
 _MKT_STORE = None
 _MKT_CLIENT = None
 # uid người được @tag gần nhất theo từng chat (cho zalo_friend_add/send_dm
@@ -2772,7 +2782,7 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
                 return SendResult(success=True, raw_response={"dropped": "terminal_repeat"})
             logger.warning("[zalo-personal] terminal failure → recovery notice cat=%s chat_hash=%s",
                            _decision.recovery_key, _chat_hash(chat_id))
-            content = _decision.cleaned_text
+            content = _persona_notice("recovery", _decision.cleaned_text)
         else:
             content = _decision.cleaned_text
         if not content.strip():
@@ -2795,7 +2805,7 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
                 logger.debug(
                     f"[zalo-personal] noisy status -> soft notice (chat={chat_id})"
                 )
-                content = _USER_SOFT_ERROR_NOTICE
+                content = _persona_notice("soft_error", _USER_SOFT_ERROR_NOTICE)
             else:
                 content = _scrub_leak(scrubbed)
 
@@ -3967,7 +3977,10 @@ def _zalo_pre_tool_call_hook(
             )
             return {
                 "action": "block",
-                "message": "Chuc nang nay chi thuc hien cho chu tai khoan (sep) thoi a.",
+                "message": _persona_notice(
+                    "deny_non_owner",
+                    "Chuc nang nay chi thuc hien cho chu tai khoan (sep) thoi a.",
+                ),
             }
         return None
     origin = sess_record.get("origin") or {}
@@ -4423,9 +4436,9 @@ def _bot_persona_path() -> Path:
     ) / "bot_persona.json"
 
 
-def _load_bot_persona() -> Dict[str, str]:
+def _load_bot_persona() -> Dict[str, Any]:
     path = _bot_persona_path()
-    persona = dict(_DEFAULT_PERSONA)
+    persona: Dict[str, Any] = dict(_DEFAULT_PERSONA)
     try:
         if path.exists():
             with open(path, encoding="utf-8") as f:
@@ -4435,6 +4448,15 @@ def _load_bot_persona() -> Dict[str, str]:
                         v = data.get(k)
                         if isinstance(v, str) and v.strip():
                             persona[k] = v.strip()
+                    # Canned-notice overrides (soft_error/recovery/deny_non_owner).
+                    # Must survive the load→save roundtrip of zalo_set_persona.
+                    notices = data.get("notices")
+                    if isinstance(notices, dict):
+                        persona["notices"] = {
+                            str(k): str(v).strip()
+                            for k, v in notices.items()
+                            if isinstance(v, str) and v.strip()
+                        }
     except Exception as e:
         logger.debug(f"[zalo-personal] load bot_persona failed: {e}")
     return persona
@@ -4463,6 +4485,7 @@ def _zalo_set_persona_handler(args: Any = None, **kwargs) -> Dict[str, Any]:
     name = p.get("name", "")
     self_intro = p.get("self_intro", "")
     personality = p.get("personality", "")
+    notices_in = p.get("notices")
     persona = _load_bot_persona()
     changed: List[str] = []
     name_s = _coerce_str_arg(name)
@@ -4477,10 +4500,38 @@ def _zalo_set_persona_handler(args: Any = None, **kwargs) -> Dict[str, Any]:
     if persona_s:
         persona["personality"] = persona_s
         changed.append("personality")
+    # Canned notices theo persona — các câu hệ thống gửi thẳng ra khách (không
+    # qua model): soft_error / recovery / deny_non_owner. Câu phải "sạch"
+    # (không trùng pattern thông báo vận hành) và <=300 ký tự, nếu không bị bỏ qua.
+    _ALLOWED_NOTICE_KEYS = ("soft_error", "recovery", "deny_non_owner")
+    if isinstance(notices_in, str):
+        try:
+            notices_in = json.loads(notices_in)
+        except Exception:
+            notices_in = None
+    if isinstance(notices_in, dict):
+        cur = dict(persona.get("notices") or {})
+        rejected: List[str] = []
+        for k in _ALLOWED_NOTICE_KEYS:
+            v = notices_in.get(k)
+            if not isinstance(v, str) or not v.strip():
+                continue
+            v = v.strip()
+            # validate qua resolve_notice: chỉ nhận câu classify KEEP + trong cap
+            if _msgfilter.resolve_notice({"notices": {k: v}}, k, "") == v:
+                cur[k] = v
+                changed.append(f"notices.{k}")
+            else:
+                rejected.append(k)
+        if cur:
+            persona["notices"] = cur
+        if rejected:
+            logger.info("[zalo-personal] persona notices rejected (unsafe/too long): %s", rejected)
     if not changed:
         return {
             "success": False,
-            "error": "Không có trường nào được set. Truyền ít nhất 1 trong: name, self_intro, personality.",
+            "error": ("Không có trường nào được set. Truyền ít nhất 1 trong: name, "
+                      "self_intro, personality, notices{soft_error,recovery,deny_non_owner}."),
             "current": persona,
         }
     _save_bot_persona(persona)
@@ -8610,6 +8661,22 @@ def _register_zalo_tools(ctx) -> None:
                                     "Phong cách giao tiếp (vd: 'casual, hài hước', "
                                     "'chuyên nghiệp ngắn gọn')."
                                 ),
+                            },
+                            "notices": {
+                                "type": "object",
+                                "description": (
+                                    "Các CÂU HỆ THỐNG gửi thẳng ra khách (không qua "
+                                    "model) — PHẢI khớp xưng hô persona. Khi owner đổi "
+                                    "persona/xưng hô, LUÔN tự soạn lại 3 câu này đúng "
+                                    "giọng mới (vd persona Ông Bụt: 'Con chờ ta một "
+                                    "chút, ta kiểm tra lại cho rõ rồi báo con ngay.'). "
+                                    "Mỗi câu ngắn gọn, <=300 ký tự, thuần trấn an."
+                                ),
+                                "properties": {
+                                    "soft_error": {"type": "string", "description": "Câu trấn an khi hệ thống trục trặc nhẹ (thay 'Anh/chị chờ em chút…')."},
+                                    "recovery": {"type": "string", "description": "Câu báo quá tải + nhờ nhắn lại (thay 'Dạ em đang hơi quá tải…')."},
+                                    "deny_non_owner": {"type": "string", "description": "Câu từ chối chức năng chỉ dành cho chủ tài khoản."},
+                                },
                             },
                         },
                     },

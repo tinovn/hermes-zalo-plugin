@@ -4,10 +4,12 @@ the bounded recovery-notice limiter. Pure stdlib unittest."""
 import unittest
 
 from message_filtering import (
+    MAX_NOTICE_LEN,
     RECOVERY_NOTICE,
     FilterAction,
     RecoveryNoticeLimiter,
     classify,
+    resolve_notice,
 )
 
 
@@ -128,6 +130,46 @@ class TestRecoveryLimiter(unittest.TestCase):
         lim.should_emit("k3", now=1)  # evicts k1
         # k1 evicted → emits again as if new
         self.assertTrue(lim.should_emit("k1", now=2))
+
+
+class TestResolveNotice(unittest.TestCase):
+    """Persona-aware canned notices: custom line wins only when safe."""
+
+    ONGBUT = {"notices": {
+        "soft_error": "Con chờ ta một chút, ta kiểm tra lại cho rõ rồi báo con ngay.",
+        "recovery": "Ta đang hơi quá tải, con nhắn lại giúp ta câu vừa rồi nhé.",
+    }}
+
+    def test_custom_notice_used(self):
+        self.assertEqual(
+            resolve_notice(self.ONGBUT, "soft_error", "default"),
+            "Con chờ ta một chút, ta kiểm tra lại cho rõ rồi báo con ngay.",
+        )
+
+    def test_fallback_when_missing(self):
+        self.assertEqual(resolve_notice(self.ONGBUT, "deny_non_owner", "mặc định"), "mặc định")
+        self.assertEqual(resolve_notice(None, "recovery", RECOVERY_NOTICE), RECOVERY_NOTICE)
+        self.assertEqual(resolve_notice({}, "recovery", "d"), "d")
+        self.assertEqual(resolve_notice({"notices": "not-a-dict"}, "recovery", "d"), "d")
+
+    def test_rejects_empty_and_oversize(self):
+        self.assertEqual(resolve_notice({"notices": {"recovery": "   "}}, "recovery", "d"), "d")
+        self.assertEqual(
+            resolve_notice({"notices": {"recovery": "x" * (MAX_NOTICE_LEN + 1)}}, "recovery", "d"),
+            "d",
+        )
+
+    def test_rejects_notice_matching_operational_pattern(self):
+        # A custom line that itself matches a filtered pattern would break
+        # classify() idempotency — must fall back to the default.
+        bad = {"notices": {"recovery": "Context length exceeded, con nhắn lại nhé"}}
+        self.assertEqual(resolve_notice(bad, "recovery", "an toàn"), "an toàn")
+
+    def test_custom_notice_is_classify_stable(self):
+        v = resolve_notice(self.ONGBUT, "recovery", RECOVERY_NOTICE)
+        d = classify(v)
+        self.assertEqual(d.action, FilterAction.KEEP)
+        self.assertEqual(d.cleaned_text, v)
 
 
 if __name__ == "__main__":

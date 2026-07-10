@@ -111,6 +111,42 @@ def classify(text: Optional[str]) -> FilterDecision:
     return FilterDecision(FilterAction.DROP_OPERATIONAL, "", cats)
 
 
+# ── Persona-aware canned notices ────────────────────────────────────────────
+# User-facing lines emitted WITHOUT an LLM in the loop (soft-error, terminal
+# recovery, non-owner deny) can be overridden per agent persona via the
+# ``notices`` map in bot_persona.json — e.g. the "Ông Bụt" persona replaces
+# "Anh/chị chờ em chút…" with "Con chờ ta một chút…". The custom line is
+# validated so it cannot itself match an operational/terminal pattern (which
+# would break classify() idempotency) and is length-capped.
+
+MAX_NOTICE_LEN = 300
+
+
+def resolve_notice(persona: Optional[dict], key: str, default: str) -> str:
+    """Return the persona's custom notice for ``key`` or ``default``.
+
+    Accepts the loaded bot-persona dict (may be None/partial). A custom notice
+    is used only when it is a non-empty single-purpose string that classifies
+    as KEEP — otherwise the safe default wins.
+    """
+    try:
+        notices = (persona or {}).get("notices")
+        if not isinstance(notices, dict):
+            return default
+        val = notices.get(key)
+        if not isinstance(val, str):
+            return default
+        val = val.strip()
+        if not val or len(val) > MAX_NOTICE_LEN:
+            return default
+        decision = classify(val)
+        if decision.action != FilterAction.KEEP or decision.cleaned_text != val:
+            return default
+        return val
+    except Exception:
+        return default
+
+
 class RecoveryNoticeLimiter:
     """At most one recovery notice per key within ``ttl`` seconds; bounded LRU.
 

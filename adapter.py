@@ -279,6 +279,14 @@ _COMPRESSION_AUTORAISE_RE = re.compile(
 )
 
 
+# Dòng đuôi "Opt back out: hermes config set ..." của thông báo auto-compaction
+# hay bị TÁCH khỏi dòng đầu bởi 1 dòng trống → _COMPRESSION_AUTORAISE_RE bỏ
+# sót. Bắt riêng để strip (thuần vận hành, phải drop im lặng cho khách).
+_COMPRESSION_OPTOUT_RE = re.compile(
+    r"(?im)^[ \t]*Opt back out:[^\n]*hermes\s+config\s+set[^\n]*$"
+)
+
+
 def _strip_non_owner_internal_noise(text: str) -> str:
     """Remove owner/debug-only Hermes diagnostics from non-owner Zalo replies.
 
@@ -294,6 +302,7 @@ def _strip_non_owner_internal_noise(text: str) -> str:
         return ""
     t = _FILE_MUTATION_FOOTER_RE.sub("", text)
     t = _COMPRESSION_AUTORAISE_RE.sub("", t).strip()
+    t = _COMPRESSION_OPTOUT_RE.sub("", t).strip()
     return t
 
 
@@ -4070,11 +4079,39 @@ def _zalo_pre_tool_call_hook(
     return _deny_msg
 
 
+def _redact_ipv4(m: "re.Match") -> str:
+    """Redact only dotted-quads that can actually be an IPv4 address.
+
+    Vietnamese prices use "." as the thousands separator, so "1.000.000.000
+    VNĐ" is a dotted-quad too. Real addresses never carry leading zeros
+    ("192.168.001.1") and never exceed 255 per octet, which is enough to tell
+    a billion đồng apart from a host.
+    """
+    octets = m.group(0).split(".")
+    for o in octets:
+        if len(o) > 1 and o[0] == "0":
+            return m.group(0)
+        if int(o) > 255:
+            return m.group(0)
+    return "[ip-ẩn]"
+
+
+# An IPv6 address either compresses a run of zeroes with "::" or spells out
+# all 8 hextets. Anything with fewer colons is prose — "10:12" is a clock,
+# not a host. Boundaries reject "std::vector" and partial dotted-quads.
+_IPV6_RE = re.compile(
+    r"(?<![0-9A-Za-z:.])(?:"
+    r"(?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}"                       # full 8-hextet
+    r"|(?:[0-9A-Fa-f]{1,4}:){1,7}:(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){0,6})?"  # a::b
+    r"|::(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){0,7})"              # ::b
+    r")(?![0-9A-Za-z:.])"
+)
+
 # Output post-filter — last line of defence. If the model leaked anything
 # the tool gate didn't catch, scrub these patterns from outgoing replies.
 _LEAK_REDACT_REGEXES = [
-    (re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"), "[ip-ẩn]"),                    # IPv4
-    (re.compile(r"\b[0-9a-fA-F:]{2,}:[0-9a-fA-F:]{2,}\b"), "[ip-ẩn]"),           # IPv6 (loose)
+    (re.compile(r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])"), _redact_ipv4),   # IPv4
+    (_IPV6_RE, "[ip-ẩn]"),                                                       # IPv6
     (re.compile(r"/opt/[\w./\-]+", re.IGNORECASE), "[path-ẩn]"),
     (re.compile(r"/etc/[\w./\-]+", re.IGNORECASE), "[path-ẩn]"),
     (re.compile(r"/root/[\w./\-]+", re.IGNORECASE), "[path-ẩn]"),

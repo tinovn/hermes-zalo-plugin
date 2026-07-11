@@ -249,6 +249,45 @@ _CRON_FOOTER_RE = re.compile(
 )
 
 
+# ── Markdown → plaintext cho Zalo (Zalo KHÔNG render markdown) ──────────────
+# Bot có thể trả lời kèm **bold**, #heading, `code`, [text](url)... Zalo hiện
+# thô các dấu này. Chuyển về text thuần, GIỮ nội dung + link bấm được.
+_MD_FENCE_RE   = re.compile(r"```[^\n]*\n?(.*?)```", re.DOTALL)
+_MD_LINK_RE    = re.compile(r"(!)?\[([^\]]*)\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
+_MD_BOLD_RE    = re.compile(r"\*\*(.+?)\*\*|__(.+?)__", re.DOTALL)
+_MD_STRIKE_RE  = re.compile(r"~~(.+?)~~", re.DOTALL)
+_MD_ITALIC_RE  = re.compile(r"(?<![\*\w])\*(?!\s)(.+?)(?<!\s)\*(?!\*)"
+                            r"|(?<![_\w])_(?!\s)(.+?)(?<!\s)_(?!\w)")
+_MD_CODE_RE    = re.compile(r"`([^`]+)`")
+_MD_HR_RE      = re.compile(r"^\s{0,3}([-*_])(?:\s*\1){2,}\s*$", re.MULTILINE)
+_MD_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+", re.MULTILINE)
+_MD_QUOTE_RE   = re.compile(r"^\s{0,3}>\s?", re.MULTILINE)
+_MD_BULLET_RE  = re.compile(r"^(\s*)[-*+]\s+", re.MULTILINE)
+
+
+def _zalo_plaintext(text: str) -> str:
+    """Chuyển markdown về text thuần cho Zalo. No-op nếu không có ký tự markdown."""
+    if not text or not any(c in text for c in "*_`#[~>"):
+        return text
+    t = _MD_FENCE_RE.sub(lambda m: m.group(1), text)
+    def _link(m):
+        label, url = m.group(2), m.group(3)
+        if m.group(1):
+            return url
+        return f"{label} ({url})" if label and label != url else url
+    t = _MD_LINK_RE.sub(_link, t)
+    t = _MD_BOLD_RE.sub(lambda m: m.group(1) or m.group(2), t)
+    t = _MD_STRIKE_RE.sub(lambda m: m.group(1), t)
+    t = _MD_ITALIC_RE.sub(lambda m: m.group(1) or m.group(2), t)
+    t = _MD_CODE_RE.sub(lambda m: m.group(1), t)
+    t = _MD_HR_RE.sub("", t)
+    t = _MD_HEADING_RE.sub("", t)
+    t = _MD_QUOTE_RE.sub("", t)
+    t = _MD_BULLET_RE.sub(lambda m: f"{m.group(1)}• ", t)
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    return t.strip()
+
+
 def _strip_cron_envelope(text: str) -> str:
     """Remove the Hermes cron/reminder delivery envelope, keep only the body."""
     if not text or ("Response" not in text and "job_id" not in text):
@@ -2759,6 +2798,7 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
         # runs for the owner DM too (the cron home channel), which the scrub
         # filters below deliberately skip.
         content = _strip_cron_envelope(content)
+        content = _zalo_plaintext(content)
         if not content.strip():
             return SendResult(success=False, error="empty content")
 

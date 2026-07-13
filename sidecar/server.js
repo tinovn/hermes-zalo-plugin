@@ -184,7 +184,10 @@ async function imageMeta(filePath) {
 }
 
 function makeZaloOptions() {
-  const opts = { selfListen: false, checkUpdate: false, logging: true, imageMetadataGetter: imageMeta };
+  // selfListen: true là BẮT BUỘC để zca-js emit group_event khi CHÍNH bot được
+  // thêm vào nhóm (isSelf=true, xem zca-js listen.js:238). Echo tin của bot bị
+  // chặn ngay trong message handler (if msg.isSelf return) nên không gây loop.
+  const opts = { selfListen: true, checkUpdate: false, logging: true, imageMetadataGetter: imageMeta };
   if (!PROXY) return opts;
   try {
     opts.agent = new HttpsProxyAgent(PROXY);
@@ -288,6 +291,9 @@ function attachApi(api) {
 
   api.listener.on("message", async (msg) => {
     try {
+      // selfListen=true khiến zca-js emit cả tin của CHÍNH bot. Chặn echo ở
+      // đây để không forward tin tự-gửi cho adapter (tránh bot tự trả lời mình).
+      if (msg && msg.isSelf) return;
       const d = msg.data || {};
       // zca-js: msg.type numeric — 0=DirectMessage, 1=GroupMessage.
       // Fallback: idTo !== self uid means it's a group thread (group id vs bot uid).
@@ -384,6 +390,12 @@ function attachApi(api) {
       // Forward friend_event tới adapter để tự-động-chấp-nhận lời mời kết bạn.
       if (evName === "friend_event") {
         try { broadcast({ type: "friend_event", data: args.length === 1 ? args[0] : args }); }
+        catch (e) { /* noop */ }
+      }
+      // Forward group_event tới adapter để chào nhóm khi bot được thêm vào group.
+      // zca-js emit GroupEvent = { type, act, data:{groupId,groupName,updateMembers,...}, threadId, isSelf }
+      if (evName === "group_event") {
+        try { broadcast({ type: "group_event", data: args.length === 1 ? args[0] : args }); }
         catch (e) { /* noop */ }
       }
     });

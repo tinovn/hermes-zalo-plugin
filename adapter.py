@@ -800,6 +800,18 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
         # hammering Zalo's API.
         self._group_members_synced: set = set()
 
+        # Groups the bot has already greeted after being added (persisted so a
+        # gateway restart / group_event replay doesn't re-send the welcome).
+        self._greeted_groups_path = Path(
+            os.getenv("ZALO_PERSONAL_SESSION_DIR") or "/opt/data/zalo"
+        ) / "greeted_groups.json"
+        self._greeted_groups: set = self._load_greeted_groups()
+        # Feature flag: auto-greet when added to a group (default on).
+        self._group_greeting_enabled = (
+            os.getenv("ZALO_PERSONAL_GROUP_GREETING", "true").strip().lower()
+            in ("1", "true", "yes", "on")
+        )
+
         # Sidecar bootstrap
         self.sidecar_dir = Path(__file__).parent / "sidecar"
         self.sidecar_log = Path(
@@ -1341,6 +1353,12 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
                 await self._mk_maybe_autoaccept(event)
             except Exception as e:
                 logger.debug(f"[zalo-mkt] autoaccept lỗi: {e}")
+            return
+        if et == "group_event":
+            try:
+                await self._handle_group_event(event)
+            except Exception as e:
+                logger.debug(f"[zalo-personal] group_event lỗi: {e}")
             return
         if et != "message":
             # ignore login_state, error, typing... for now
@@ -2218,6 +2236,27 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.debug(f"[zalo-personal] save last_seen failed: {e}")
 
+    def _load_greeted_groups(self) -> set:
+        try:
+            if self._greeted_groups_path.exists():
+                with open(self._greeted_groups_path, encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, list):
+                        return {str(x) for x in data}
+        except Exception as e:
+            logger.debug(f"[zalo-personal] load greeted_groups failed: {e}")
+        return set()
+
+    def _save_greeted_groups(self) -> None:
+        try:
+            self._greeted_groups_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._greeted_groups_path.with_suffix(".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(sorted(self._greeted_groups), f)
+            tmp.replace(self._greeted_groups_path)
+        except Exception as e:
+            logger.debug(f"[zalo-personal] save greeted_groups failed: {e}")
+
     def _seed_thread_types_from_sessions(self) -> None:
         """Populate ``_thread_types`` from the on-disk session directory so
         outbound messages (cron output, scheduled reminders, owner DMs that
@@ -2383,6 +2422,28 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
         """
         if not text or not chat_id or "@" not in text:
             return []
+        mentions: List[Dict[str, Any]] = []
+        # Track which character positions are already used so we don't
+        # double-mention the same span (e.g. @Duy inside @Duy Tran).
+        consumed = [False] * len(text)
+        # ``@All`` → tag toàn nhóm. zca-js coi mention có ``uid == "-1"`` là
+        # type 1 = mention-all (sendMessage.js). Xử lý TRƯỚC danh bạ member,
+        # và không cần group-member directory.
+        _all_start = 0
+        while True:
+            _pos = text.find("@All", _all_start)
+            if _pos < 0:
+                break
+            _end = _pos + 4
+            # word boundary: "@All" không dính chữ phía sau (vd "@Allen")
+            _boundary_ok = _end >= len(text) or not (
+                text[_end].isalnum() or text[_end] == "_"
+            )
+            if _boundary_ok and not any(consumed[_pos:_end]):
+                mentions.append({"pos": _pos, "uid": "-1", "len": 4})
+                for _i in range(_pos, _end):
+                    consumed[_i] = True
+            _all_start = _end
         members = self._group_members.get(str(chat_id)) or {}
         # Also allow tagging the owner (chính sếp) by name.
         owner_name = (
@@ -2390,14 +2451,8 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
         )
         if owner_name and self.owner_uid:
             members = {**members, owner_name: self.owner_uid}
-        if not members:
-            return []
         # Longest-first so "Duy Tran" beats "Duy"
         sorted_names = sorted(members.keys(), key=lambda n: -len(n))
-        mentions: List[Dict[str, Any]] = []
-        # Track which character positions are already used so we don't
-        # double-mention the same span (e.g. @Duy inside @Duy Tran).
-        consumed = [False] * len(text)
         for name in sorted_names:
             target = "@" + name
             tlen = len(target)
@@ -2424,6 +2479,94 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
                 start = pos + tlen
         mentions.sort(key=lambda m: m["pos"])
         return mentions
+
+    async def _handle_group_event(self, event: Dict[str, Any]) -> None:
+        """Chào nhóm khi CHÍNH bot được thêm vào group.
+
+        Sidecar forward zca-js GroupEvent dưới dạng
+        ``{"type":"group_event","data":{type, act, data:{...}, threadId, isSelf}}``.
+        Khi ``type == "join"`` và ``isSelf`` (bot nằm trong updateMembers), bot
+        tự soạn 1 lời chào (LLM, theo tên nhóm) rồi gửi kèm tag @All.
+        """
+        if not self._group_greeting_enabled:
+            return
+        ev = event.get("data")
+        if not isinstance(ev, dict):
+            return
+        etype = str(ev.get("type") or "").lower()
+        # Bot được thêm vào nhóm = JOIN (thành viên mới) với isSelf=True.
+        if etype not in ("join", "new_link"):
+            return
+        if not ev.get("isSelf"):
+            return
+        inner = ev.get("data") if isinstance(ev.get("data"), dict) else {}
+        group_id = str(
+            ev.get("threadId")
+            or inner.get("groupId")
+            or inner.get("group_id")
+            or ""
+        ).strip()
+        if not group_id:
+            return
+        # Chống gửi trùng (reconnect / event replay).
+        if group_id in self._greeted_groups:
+            return
+        # Kênh zalo-personal bị TẮT qua lệnh owner → không chào.
+        if not _channel_is_active("zalo-personal"):
+            return
+        group_name = str(
+            inner.get("groupName") or inner.get("group_name") or ""
+        ).strip()
+        if not group_name:
+            try:
+                group_name = await self._resolve_group_name(group_id)
+            except Exception:
+                group_name = ""
+        # Đánh dấu ĐÃ chào TRƯỚC khi gọi agent để tránh double nếu event lặp.
+        self._greeted_groups.add(group_id)
+        self._save_greeted_groups()
+        self._thread_types[group_id] = "group"
+        logger.info(
+            f"[zalo-personal] bot được thêm vào group '{group_name}' "
+            f"({group_id}) — soạn lời chào"
+        )
+        # LLM tự soạn lời chào theo tên nhóm. Đẩy qua pipeline agent với
+        # internal=True (bỏ qua authz + require_mention); câu trả lời của agent
+        # được gửi vào group, "@All" được resolve ở đường outbound.
+        _gn = group_name or "nhóm này"
+        prompt = (
+            "[SỰ KIỆN HỆ THỐNG — không phải tin của người dùng] "
+            f"Bạn vừa được thêm vào một nhóm Zalo tên \"{_gn}\". "
+            "Hãy soạn ĐÚNG MỘT tin nhắn chào cả nhóm, thân thiện, ngắn gọn:\n"
+            "• Dòng đầu bắt đầu bằng \"@All\" (giữ nguyên đúng chữ này để tag mọi người), "
+            "kèm 1 emoji vẫy chào (ví dụ 👋).\n"
+            "• Giới thiệu bản thân ngắn gọn.\n"
+            f"• Suy ra chủ đề nhóm từ tên \"{_gn}\" rồi nêu 2-3 việc bạn giúp được "
+            "phù hợp chủ đề đó, MỖI việc xuống dòng riêng và bắt đầu bằng 1 emoji "
+            "hợp ngữ cảnh (ví dụ 📈 💰 📅 🏸 📊 📝 …).\n"
+            "• Kết bằng lời mời mọi người tag tên bạn kèm câu hỏi để được hỗ trợ.\n"
+            "YÊU CẦU TRÌNH BÀY: chèn emoji/icon hợp lý, chia thành các đoạn ngắn "
+            "cách nhau bằng dòng trống cho thoáng, TRÁNH viết một khối chữ dồn dập. "
+            "Đừng lạm dụng quá nhiều emoji (mỗi dòng tối đa 1-2 cái).\n"
+            "Chỉ xuất ra nội dung tin nhắn chào, không thêm giải thích."
+        )
+        source = self._group_shared_source(group_id, group_name)
+        try:
+            msg_event = MessageEvent(
+                text=prompt,
+                source=source,
+                internal=True,
+                message_id=str(int(time.time() * 1000)),
+                timestamp=datetime.datetime.now(),
+            )
+            await self.handle_message(msg_event)
+        except Exception as e:
+            logger.warning(
+                f"[zalo-personal] gửi lời chào group {group_id} lỗi: {e}"
+            )
+            # Rollback marker để thử lại lần sau nếu thất bại.
+            self._greeted_groups.discard(group_id)
+            self._save_greeted_groups()
 
     def _remember_quote_payload(self, message_id: str, event: Dict[str, Any]) -> None:
         """Stash the Zalo quote-payload for a received message, keyed by
@@ -2850,11 +2993,17 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
                 return SendResult(success=True, raw_response={"dropped": "owner_only_internal_notice"})
             scrubbed = _scrub_outgoing(content)
             if scrubbed is None:
-                # Lỗi/nội bộ với user thường: KHÔNG im lặng, nhắn nhẹ trấn an.
+                # Nội dung bị coi là nhiễu/nội bộ với khách thường. Trước đây
+                # gửi câu trấn an (_USER_SOFT_ERROR_NOTICE); nay TẮT theo yêu cầu
+                # → im lặng (drop) thay vì gửi "Anh/chị chờ em chút…".
                 logger.debug(
-                    f"[zalo-personal] noisy status -> soft notice (chat={chat_id})"
+                    f"[zalo-personal] noisy status -> dropped (soft notice disabled) "
+                    f"(chat={chat_id})"
                 )
-                content = _persona_notice("soft_error", _USER_SOFT_ERROR_NOTICE)
+                return SendResult(
+                    success=True,
+                    raw_response={"dropped": "soft_error_notice_disabled"},
+                )
             else:
                 content = _scrub_leak(scrubbed)
 

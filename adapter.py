@@ -2550,7 +2550,19 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
             "Đừng lạm dụng quá nhiều emoji (mỗi dòng tối đa 1-2 cái).\n"
             "Chỉ xuất ra nội dung tin nhắn chào, không thêm giải thích."
         )
-        source = self._group_shared_source(group_id, group_name)
+        # QUAN TRỌNG: KHÔNG dùng session ngữ cảnh chung của nhóm
+        # (_group_shared_source) cho lời chào — nếu không, prompt lệnh chào sẽ
+        # được lưu vào transcript nhóm và bị _build_group_context nạp lại ở MỌI
+        # lượt sau → bot chào đi chào lại mỗi khi có người mention. Dùng session
+        # RIÊNG chỉ để sinh lời chào 1 lần; reply vẫn về đúng group nhờ
+        # chat_id=group_id.
+        source = self.build_source(
+            chat_id=group_id,
+            chat_name=group_name or f"zalo-group:{group_id}",
+            chat_type="group",
+            user_id=f"zalo:__greeting__:{group_id}",
+            user_name="group-greeting",
+        )
         try:
             msg_event = MessageEvent(
                 text=prompt,

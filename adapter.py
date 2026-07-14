@@ -812,6 +812,27 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
             in ("1", "true", "yes", "on")
         )
 
+        # Người lạ DM bot → tự gửi lời mời kết bạn. Persist uid đã mời để
+        # restart không mời lại (Zalo coi mời trùng là spam → rủi ro khoá).
+        self._auto_friend_path = Path(
+            os.getenv("ZALO_PERSONAL_SESSION_DIR") or "/opt/data/zalo"
+        ) / "auto_friend_requested.json"
+        self._auto_friend_requested: set = self._load_auto_friend_requested()
+        # uid đang trong quá trình mời (giữa 2 await) — chặn 2 tin đến gần nhau
+        # cùng lọt qua vòng kiểm tra và sinh 2 lời mời.
+        self._auto_friend_inflight: set = set()
+        self._auto_friend_enabled = (
+            os.getenv("ZALO_PERSONAL_AUTO_FRIEND_ON_DM", "true").strip().lower()
+            in ("1", "true", "yes", "on")
+        )
+        # Lời nhắn kèm lời mời. Bỏ trống = mời không kèm lời nhắn.
+        self._auto_friend_msg = os.getenv(
+            "ZALO_PERSONAL_AUTO_FRIEND_MSG", "Mình kết bạn để tiện hỗ trợ nhé!"
+        ).strip()
+        # Cache danh bạ (uid) để không gọi /friends/all mỗi tin nhắn.
+        self._friend_uids: set = set()
+        self._friend_uids_ts: float = 0.0
+
         # Sidecar bootstrap
         self.sidecar_dir = Path(__file__).parent / "sidecar"
         self.sidecar_log = Path(
@@ -1494,6 +1515,11 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
             ):
                 logger.info(f"[zalo-personal] ignored DM from non-allowed uid={from_uid}")
                 return
+            # Người lạ (chưa có trong danh bạ) nhắn tin → tự gửi lời mời kết bạn.
+            # Chạy NỀN: không chặn đường trả lời tin (gọi /friends/all + API mời
+            # có thể mất vài giây).
+            if self._auto_friend_enabled and from_uid != self.owner_uid:
+                asyncio.create_task(self._maybe_auto_friend_request(from_uid))
             # listen_only in a DM: skip reply but still observe.
             if chat_mode == "listen_only":
                 logger.debug(
@@ -2256,6 +2282,93 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
             tmp.replace(self._greeted_groups_path)
         except Exception as e:
             logger.debug(f"[zalo-personal] save greeted_groups failed: {e}")
+
+    def _load_auto_friend_requested(self) -> set:
+        try:
+            if self._auto_friend_path.exists():
+                with open(self._auto_friend_path, encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, list):
+                        return {str(x) for x in data}
+        except Exception as e:
+            logger.debug(f"[zalo-personal] load auto_friend_requested failed: {e}")
+        return set()
+
+    def _save_auto_friend_requested(self) -> None:
+        try:
+            self._auto_friend_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._auto_friend_path.with_suffix(".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(sorted(self._auto_friend_requested), f)
+            tmp.replace(self._auto_friend_path)
+        except Exception as e:
+            logger.debug(f"[zalo-personal] save auto_friend_requested failed: {e}")
+
+    async def _is_friend(self, uid: str) -> bool:
+        """uid đã nằm trong danh bạ chưa. Cache 5 phút — /friends/all là API
+        nặng, không thể gọi mỗi tin nhắn đến."""
+        now = time.time()
+        if now - self._friend_uids_ts > 300:
+            try:
+                r = await asyncio.to_thread(_mk_client().get_all_friends)
+                if r.get("ok"):
+                    self._friend_uids = {
+                        str(f.get("uid")) for f in (r.get("friends") or []) if f.get("uid")
+                    }
+                    self._friend_uids_ts = now
+            except Exception as e:
+                logger.debug(f"[zalo-personal] refresh friends failed: {e}")
+                # Không refresh được → coi như ĐÃ là bạn để KHÔNG mời nhầm.
+                return True
+        return str(uid) in self._friend_uids
+
+    async def _maybe_auto_friend_request(self, uid: str) -> None:
+        """Người lạ DM bot → tự gửi lời mời kết bạn (1 lần/uid, có hạn mức).
+
+        Dùng chung hạn mức ngày ``daily_friend_cap`` với phễu marketing để
+        tổng số lời mời/ngày không vượt ngưỡng an toàn của Zalo.
+        """
+        uid = str(uid or "").strip()
+        if not self._auto_friend_enabled or not uid:
+            return
+        if uid == self.owner_uid or uid == self._self_uid:
+            return
+        if uid in self._auto_friend_requested or uid in self._auto_friend_inflight:
+            return
+        # Giữ chỗ NGAY (trước mọi await): người lạ nhắn dồn 5 tin thì 5 task nền
+        # cùng chạy, nếu chỉ dựa vào _auto_friend_requested (chỉ được ghi sau khi
+        # tra danh bạ xong) thì cả 5 đều lọt qua → 5 lời mời trùng.
+        self._auto_friend_inflight.add(uid)
+        try:
+            if await self._is_friend(uid):
+                return
+            store = _mk_store()
+            today = _mk_today()
+            if store.remaining("friend", today) <= 0:
+                logger.info(
+                    f"[zalo-personal] hết hạn mức kết bạn hôm nay — không tự mời uid={uid}"
+                )
+                return
+            try:
+                r = await asyncio.to_thread(
+                    _mk_client().friend_request, uid, self._auto_friend_msg
+                )
+            except Exception as e:
+                logger.debug(f"[zalo-personal] tự mời kết bạn uid={uid} lỗi: {e}")
+                return
+            if r.get("ok"):
+                # Chỉ ghi nhớ khi mời THÀNH CÔNG — mời hỏng thì tin sau thử lại.
+                self._auto_friend_requested.add(uid)
+                self._save_auto_friend_requested()
+                store.incr("friend", today)
+                self._friend_uids_ts = 0.0  # buộc refresh danh bạ ở lần sau
+                logger.info(f"[zalo-personal] đã tự gửi lời mời kết bạn tới uid={uid}")
+            else:
+                logger.debug(
+                    f"[zalo-personal] tự mời kết bạn uid={uid} thất bại: {r.get('error')}"
+                )
+        finally:
+            self._auto_friend_inflight.discard(uid)
 
     def _seed_thread_types_from_sessions(self) -> None:
         """Populate ``_thread_types`` from the on-disk session directory so

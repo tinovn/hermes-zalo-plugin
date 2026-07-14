@@ -176,3 +176,42 @@ class RecoveryNoticeLimiter:
         while len(self._seen) > self._max:
             self._seen.popitem(last=False)
         return True
+
+
+# ── Name triggers ──────────────────────────────────────────────────────────
+# Cho phép gọi bot bằng TÊN trong nhóm (vd "ông bụt ơi") mà không cần @tag.
+# Ở chế độ mention_only, một tin coi như "được nhắc" nếu chứa một trong các tên
+# gọi cấu hình → bot phản hồi đúng khi được gọi tên, KHÔNG phản hồi mọi tin.
+
+def parse_name_triggers(raw) -> List[str]:
+    """Parse cấu hình tên gọi → list token thường-hoá, bỏ trống/trùng.
+
+    Nhận chuỗi phân tách bằng dấu phẩy ("Ông Bụt, Bụt") hoặc list. Trả về các
+    token đã ``strip().lower()`` (khớp không phân biệt hoa/thường), giữ thứ tự.
+    """
+    if isinstance(raw, str):
+        items = raw.split(",")
+    elif isinstance(raw, (list, tuple, set)):
+        items = list(raw)
+    else:
+        return []
+    out: List[str] = []
+    seen = set()
+    for it in items:
+        t = str(it).strip().lower()
+        if t and t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
+
+def text_has_name_trigger(text: Optional[str], triggers) -> bool:
+    """True nếu ``text`` (không phân biệt hoa/thường) chứa BẤT KỲ tên gọi nào.
+
+    So khớp dạng substring — "ông bụt" khớp "ông bụt ơi", "nhờ ông bụt tí". Rỗng
+    triggers → luôn False (tắt tính năng, chỉ @tag mới kích hoạt).
+    """
+    low = (text or "").lower()
+    if not low:
+        return False
+    return any(t and t in low for t in (triggers or ()))

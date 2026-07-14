@@ -9,7 +9,9 @@ from message_filtering import (
     FilterAction,
     RecoveryNoticeLimiter,
     classify,
+    parse_name_triggers,
     resolve_notice,
+    text_has_name_trigger,
 )
 
 
@@ -170,6 +172,36 @@ class TestResolveNotice(unittest.TestCase):
         d = classify(v)
         self.assertEqual(d.action, FilterAction.KEEP)
         self.assertEqual(d.cleaned_text, v)
+
+
+class TestNameTriggers(unittest.TestCase):
+    def test_parse_csv_lowercases_trims_dedups(self):
+        self.assertEqual(
+            parse_name_triggers("Ông Bụt, bụt ,  Ông Bụt "),
+            ["ông bụt", "bụt"],
+        )
+
+    def test_parse_list_and_empty(self):
+        self.assertEqual(parse_name_triggers(["Bụt", " "]), ["bụt"])
+        self.assertEqual(parse_name_triggers(""), [])
+        self.assertEqual(parse_name_triggers(None), [])
+        self.assertEqual(parse_name_triggers(123), [])
+
+    def test_match_substring_case_insensitive(self):
+        trg = parse_name_triggers("ông bụt, bụt")
+        self.assertTrue(text_has_name_trigger("Ông Bụt ơi cho hỏi", trg))
+        self.assertTrue(text_has_name_trigger("nhờ ông bụt tí", trg))
+        self.assertTrue(text_has_name_trigger("BỤT giúp con với", trg))
+
+    def test_no_match_when_name_absent(self):
+        trg = parse_name_triggers("ông bụt, bụt")
+        self.assertFalse(text_has_name_trigger("ok anh", trg))
+        self.assertFalse(text_has_name_trigger("alo alo", trg))
+
+    def test_empty_triggers_never_match(self):
+        # Rỗng = tắt: chỉ @tag mới kích hoạt, name-trigger không bao giờ đúng.
+        self.assertFalse(text_has_name_trigger("ông bụt ơi", []))
+        self.assertFalse(text_has_name_trigger("", ["bụt"]))
 
 
 if __name__ == "__main__":

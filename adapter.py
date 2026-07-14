@@ -701,6 +701,14 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
         else:
             rm_val = rm_env.lower() in ("1", "true", "yes", "on")
         self.require_mention = bool(rm_val)
+        # Name triggers — trong nhóm, ngoài @mention/reply-to-bot, coi như "được
+        # nhắc" khi văn bản chứa một trong các TÊN GỌI này (vd "ông bụt", "bụt").
+        # Cho phép gọi bot bằng tên mà KHÔNG cần @tag, ở chế độ mention_only nên
+        # KHÔNG phản hồi mọi tin. Rỗng (mặc định) = tắt, chỉ @tag mới kích hoạt.
+        self.name_triggers = _msgfilter.parse_name_triggers(
+            os.getenv("ZALO_PERSONAL_NAME_TRIGGERS")
+            or extra.get("name_triggers", "")
+        )
         # Group senders allowlist (Zalo UIDs). Empty = every member.
         raw_gallow_from = (
             os.getenv("ZALO_PERSONAL_GROUP_ALLOW_FROM")
@@ -2033,6 +2041,11 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
         # Fallback: zca-js sometimes renders mention as "@DisplayName" in text.
         self_name = event.get("self_name") or content.get("self_name")
         if self_name and isinstance(self_name, str) and self_name.lower() in text.lower():
+            return True
+        # Fallback 2: TÊN GỌI cấu hình (ZALO_PERSONAL_NAME_TRIGGERS) — cho phép
+        # gọi bot bằng tên trong văn bản (vd "ông bụt ơi") mà không cần @tag.
+        # self_name của Zalo thường null nên đây là đường chính để bắt gọi-tên.
+        if _msgfilter.text_has_name_trigger(text, getattr(self, "name_triggers", ())):
             return True
         return False
 

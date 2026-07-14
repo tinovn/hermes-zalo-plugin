@@ -701,10 +701,9 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
         else:
             rm_val = rm_env.lower() in ("1", "true", "yes", "on")
         self.require_mention = bool(rm_val)
-        # Name triggers — trong nhóm, ngoài @mention/reply-to-bot, coi như "được
-        # nhắc" khi văn bản chứa một trong các TÊN GỌI này (vd "ông bụt", "bụt").
-        # Cho phép gọi bot bằng tên mà KHÔNG cần @tag, ở chế độ mention_only nên
-        # KHÔNG phản hồi mọi tin. Rỗng (mặc định) = tắt, chỉ @tag mới kích hoạt.
+        # Name triggers — biệt danh gọi bot trong nhóm (ngoài @tag/reply-to-bot,
+        # persona name). Bổ sung vào alias trong _is_self_mentioned. Comma-sep,
+        # khớp substring không phân biệt hoa/thường. Rỗng = chỉ dùng persona name.
         self.name_triggers = _msgfilter.parse_name_triggers(
             os.getenv("ZALO_PERSONAL_NAME_TRIGGERS")
             or extra.get("name_triggers", "")
@@ -1751,17 +1750,19 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
             #   active       → trigger every msg (no mention required)
             #   sales_active → trigger every msg; sales-mode prompt steers
             #                  the agent to reply selectively + suggest products
-            #   mention_only → @mention / reply-to-bot only
+            #   active_mention_only → observe all msgs, trigger only when
+            #                  @mentioned / name-mentioned / reply-to-bot
+            #   mention_only → @mention / name-mention / reply-to-bot only
             #   listen_only  → never trigger (observe only)
-            #   default      → @mention / reply-to-bot only (safe default)
+            #   default      → @mention / name-mention / reply-to-bot only (safe default)
             if chat_mode in ("active", "sales_active"):
                 triggered = True
             elif chat_mode == "listen_only":
                 triggered = False
-            else:  # mention_only or default
+            else:  # active_mention_only, mention_only or default
                 triggered = is_mentioned or is_reply_to_bot
             if not triggered:
-                if self.observe_unmentioned:
+                if self.observe_unmentioned or chat_mode == "active_mention_only":
                     await self._observe_group_message(
                         text=text,
                         from_uid=from_uid,
@@ -2039,14 +2040,32 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
                 if str(m.get("uid") or "") == self._self_uid:
                     return True
         # Fallback: zca-js sometimes renders mention as "@DisplayName" in text.
+        # Also allow plain name mentions (owner use-case: active listening but
+        # only reply when people say the bot name, e.g. "ông bụt ai").
+        text_l = (text or "").lower()
+        aliases = []
         self_name = event.get("self_name") or content.get("self_name")
-        if self_name and isinstance(self_name, str) and self_name.lower() in text.lower():
-            return True
-        # Fallback 2: TÊN GỌI cấu hình (ZALO_PERSONAL_NAME_TRIGGERS) — cho phép
-        # gọi bot bằng tên trong văn bản (vd "ông bụt ơi") mà không cần @tag.
-        # self_name của Zalo thường null nên đây là đường chính để bắt gọi-tên.
-        if _msgfilter.text_has_name_trigger(text, getattr(self, "name_triggers", ())):
-            return True
+        if self_name and isinstance(self_name, str):
+            aliases.append(self_name)
+        try:
+            persona = _load_bot_persona()
+            chat_persona = _get_chat_persona(str(event.get("thread_id") or ""))
+            aliases.extend([
+                chat_persona.get("name", ""),
+                persona.get("name", ""),
+                "Ông Bụt AI",
+                "Ông Bụt Ai",
+                "Bụt AI",
+            ])
+        except Exception:
+            aliases.extend(["Ông Bụt AI", "Ông Bụt Ai", "Bụt AI"])
+        # Tên gọi cấu hình qua ENV (ZALO_PERSONAL_NAME_TRIGGERS) — bổ sung vào
+        # alias, cho phép gọi bot bằng biệt danh ngắn ("bụt", "ông bụt ơi") mà
+        # persona name (thường dài, vd "Ông Bụt AI") không bắt được.
+        aliases.extend(getattr(self, "name_triggers", []))
+        for alias in aliases:
+            if isinstance(alias, str) and alias.strip() and alias.strip().lower() in text_l:
+                return True
         return False
 
     # Tokens mà nếu xuất hiện trong tên hiển thị của NGƯỜI KHÔNG PHẢI CHỦ
@@ -2620,10 +2639,8 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
         if not isinstance(ev, dict):
             return
         etype = str(ev.get("type") or "").lower()
-        # Bot được thêm vào nhóm = JOIN (thành viên mới) với isSelf=True.
+        # Bot/thành viên được thêm vào nhóm = JOIN (hoặc new_link).
         if etype not in ("join", "new_link"):
-            return
-        if not ev.get("isSelf"):
             return
         inner = ev.get("data") if isinstance(ev.get("data"), dict) else {}
         group_id = str(
@@ -2634,20 +2651,23 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
         ).strip()
         if not group_id:
             return
-        # Chống gửi trùng (reconnect / event replay).
-        if group_id in self._greeted_groups:
-            return
         # Kênh zalo-personal bị TẮT qua lệnh owner → không chào.
         if not _channel_is_active("zalo-personal"):
             return
-        group_name = str(
-            inner.get("groupName") or inner.get("group_name") or ""
-        ).strip()
-        if not group_name:
-            try:
-                group_name = await self._resolve_group_name(group_id)
-            except Exception:
-                group_name = ""
+        # Lấy tên nhóm bằng code có sẵn của adapter (cache + sidecar
+        # getGroupInfo), thay vì tự tin vào payload group_event.
+        try:
+            group_name = await self._resolve_group_name(group_id)
+        except Exception:
+            group_name = ""
+        self._thread_types[group_id] = "group"
+        if not ev.get("isSelf"):
+            await self._handle_group_member_join(inner, group_id, group_name)
+            return
+        # Chống gửi trùng lời chào khi CHÍNH bot được thêm vào group
+        # (reconnect / event replay). Không áp dụng cho thành viên mới.
+        if group_id in self._greeted_groups:
+            return
         # Đánh dấu ĐÃ chào TRƯỚC khi gọi agent để tránh double nếu event lặp.
         self._greeted_groups.add(group_id)
         self._save_greeted_groups()
@@ -2710,6 +2730,164 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
             # Rollback marker để thử lại lần sau nếu thất bại.
             self._greeted_groups.discard(group_id)
             self._save_greeted_groups()
+
+    async def _handle_group_member_join(
+        self, inner: Dict[str, Any], group_id: str, group_name: str
+    ) -> None:
+        """Gửi lời chào khi thành viên mới vào nhóm.
+
+        Template nằm trong `/opt/data/zalo/bot_persona.json` để nội dung chào
+        mừng do owner chỉnh không bị mất khi cập nhật plugin. Hỗ trợ các biến:
+        `{group_name}`, `{member_name}`, `{member_names}`.
+        """
+        persona = _load_bot_persona()
+        if persona.get("group_member_welcome_enabled") is False:
+            return
+        members = inner.get("updateMembers")
+        if not isinstance(members, list) or not members:
+            return
+        new_names: List[str] = []
+        for m in members:
+            if not isinstance(m, dict):
+                continue
+            uid = str(m.get("id") or m.get("uid") or "").strip()
+            if self._self_uid and uid == self._self_uid:
+                continue
+            name = str(m.get("dName") or m.get("name") or "").strip()
+            if uid and name:
+                self._remember_group_member(group_id, uid, name)
+            if name:
+                new_names.append(name)
+        if not new_names:
+            return
+        template = str(persona.get("group_welcome_text") or "").strip()
+        if not template:
+            template = (
+                "@All 👋 Chào mừng {member_names} vào nhóm {group_name} nha!\n\n"
+                "Ta là Ông Bụt AI — trợ lý ảo của nhóm. Con cứ tag ta kèm câu hỏi "
+                "hoặc yêu cầu cụ thể, ta xử lý cho nhanh gọn nha."
+            )
+        rendered = self._render_group_welcome_template(
+            template, group_name=group_name, member_names=new_names
+        )
+        try:
+            result = await self.send(
+                group_id,
+                rendered,
+                metadata={"thread_type": "group", "event": "group_member_join"},
+            )
+            if not result.success:
+                logger.warning(
+                    f"[zalo-personal] member welcome send failed group={group_id}: "
+                    f"{result.error}"
+                )
+        except Exception as e:
+            logger.warning(
+                f"[zalo-personal] member welcome exception group={group_id}: {e}"
+            )
+
+    @staticmethod
+    def _render_group_welcome_template(
+        template: str, group_name: str, member_names: List[str]
+    ) -> str:
+        group = (group_name or "nhóm mình").strip()
+        names = [str(n).strip() for n in (member_names or []) if str(n).strip()]
+        member_names_s = ", ".join(names) if names else "thành viên mới"
+        member_name_s = names[0] if names else "thành viên mới"
+        topic = ZaloPersonalAdapter._infer_group_topic_label(group)
+        topic_help_list = ZaloPersonalAdapter._infer_group_topic_help_list(group)
+        text = str(template or "")
+        replacements = {
+            "{group_name}": group,
+            "{{group_name}}": group,
+            "{group_topic}": topic,
+            "{{group_topic}}": topic,
+            "{topic_help_list}": topic_help_list,
+            "{{topic_help_list}}": topic_help_list,
+            "{member_names}": member_names_s,
+            "{{member_names}}": member_names_s,
+            "{member_name}": member_name_s,
+            "{{member_name}}": member_name_s,
+        }
+        for key, value in replacements.items():
+            text = text.replace(key, value)
+        # Backward compatibility for the earlier fixed test greeting.
+        text = text.replace("Chào cả nhóm test nha!", f"Chào cả nhóm {group} nha!")
+        return text.strip()
+
+    @staticmethod
+    def _infer_group_topic_label(group_name: str) -> str:
+        """Infer a short human label from the Zalo group name for greetings."""
+        name = (group_name or "").strip()
+        low = name.lower()
+        rules = (
+            (("chứng khoán", "chung khoan", "stock", "trading", "crypto", "coin"), "Chứng khoán"),
+            (("sinh viên", "sinh vien", "student", "k15", "k16", "ufm", "vku"), "Sinh viên"),
+            (("tuyển dụng", "tuyen dung", "việc làm", "viec lam", "job", "hr"), "Tuyển dụng"),
+            (("bất động sản", "bat dong san", "bđs", "bds"), "Bất động sản"),
+            (("marketing", "seo", "content"), "Marketing"),
+            (("bán hàng", "ban hang", "sales", "kinh doanh"), "Bán hàng"),
+        )
+        for keys, label in rules:
+            if any(k in low for k in keys):
+                return label
+        return name or "nhóm mình"
+
+    @staticmethod
+    def _infer_group_topic_help_list(group_name: str) -> str:
+        """Return 3-5 greeting bullets tailored to the inferred group topic."""
+        name = (group_name or "").strip()
+        low = name.lower()
+        topic_rules: Tuple[Tuple[Tuple[str, ...], Tuple[str, ...]], ...] = (
+            (("chứng khoán", "chung khoan", "stock", "trading", "crypto", "coin"), (
+                "📈 Tóm tắt tin thị trường, mã cổ phiếu và xu hướng nổi bật",
+                "💰 Gợi ý checklist quản trị rủi ro, vốn và kỷ luật giao dịch",
+                "🧾 Soạn kịch bản nhận định, bản tin, recap phiên cho nhóm",
+                "📊 Lập bảng theo dõi danh mục, watchlist, kế hoạch mua/bán",
+            )),
+            (("sinh viên", "sinh vien", "student", "k15", "k16", "ufm", "vku"), (
+                "🎓 Tóm tắt bài học, tài liệu, đề cương ôn tập",
+                "📝 Soạn bài thuyết trình, báo cáo, CV và email xin thực tập",
+                "📚 Lên kế hoạch học tập, lịch deadline, checklist bài nhóm",
+                "💡 Gợi ý ý tưởng nghiên cứu, dự án, hoạt động CLB",
+            )),
+            (("tuyển dụng", "tuyen dung", "việc làm", "viec lam", "job", "hr"), (
+                "📌 Soạn JD, bài đăng tuyển và tin nhắn mời ứng viên",
+                "🧑‍💼 Lọc CV theo tiêu chí, tạo checklist phỏng vấn",
+                "💬 Viết kịch bản phỏng vấn, email hẹn lịch, thư offer/từ chối",
+                "📊 Tổng hợp pipeline ứng viên, báo cáo tuyển dụng nhanh",
+            )),
+            (("bất động sản", "bat dong san", "bđs", "bds"), (
+                "🏡 Soạn mô tả tin đăng nhà đất, kịch bản tư vấn khách",
+                "📍 Tóm tắt tiện ích khu vực, điểm mạnh dự án/sản phẩm",
+                "📞 Viết tin nhắn chăm sóc lead, follow-up khách quan tâm",
+                "📊 Lập bảng so sánh giá, diện tích, pháp lý, ưu nhược điểm",
+            )),
+            (("marketing", "seo", "content"), (
+                "📣 Lên ý tưởng campaign, angle nội dung và lịch đăng bài",
+                "✍️ Soạn caption, bài PR, kịch bản video ngắn",
+                "🔍 Gợi ý từ khoá SEO, tiêu đề, mô tả và outline bài viết",
+                "📊 Tổng hợp insight, checklist tối ưu nội dung/quảng cáo",
+            )),
+            (("bán hàng", "ban hang", "sales", "kinh doanh"), (
+                "🛒 Soạn kịch bản tư vấn, chốt đơn và xử lý từ chối",
+                "📦 Viết mô tả sản phẩm, bảng giá, chương trình ưu đãi",
+                "💬 Tạo tin nhắn chăm sóc khách cũ, follow-up lead",
+                "📊 Tổng hợp đơn hàng, nhu cầu khách và báo cáo bán hàng",
+            )),
+        )
+        for keys, bullets in topic_rules:
+            if any(k in low for k in keys):
+                return "\n".join(bullets)
+        # Generic fallback still related to the named group, without replacing
+        # the separate common capability list that follows in the template.
+        group_label = name or "nhóm mình"
+        return "\n".join((
+            f"🧭 Tóm tắt và hệ thống hoá nội dung thảo luận trong {group_label}",
+            "📝 Soạn thông báo, kế hoạch, checklist việc cần làm cho nhóm",
+            "💡 Gợi ý ý tưởng, kịch bản trả lời và phương án triển khai nhanh",
+            "📊 Tổng hợp thông tin, lập bảng theo dõi và báo cáo ngắn gọn",
+        ))
 
     def _remember_quote_payload(self, message_id: str, event: Dict[str, Any]) -> None:
         """Stash the Zalo quote-payload for a received message, keyed by
@@ -4815,10 +4993,24 @@ def _load_bot_persona() -> Dict[str, Any]:
             with open(path, encoding="utf-8") as f:
                 data = json.load(f)
                 if isinstance(data, dict):
-                    for k in ("name", "self_intro", "personality"):
+                    for k in (
+                        "name",
+                        "self_intro",
+                        "personality",
+                        # Runtime-configured group welcome template. Kept in
+                        # bot_persona.json (outside the plugin) so operator
+                        # edits survive plugin updates. Current adapter code
+                        # consumes this for member-join greetings; older code
+                        # safely ignores it.
+                        "group_welcome_text",
+                    ):
                         v = data.get(k)
                         if isinstance(v, str) and v.strip():
                             persona[k] = v.strip()
+                    if isinstance(data.get("group_member_welcome_enabled"), bool):
+                        persona["group_member_welcome_enabled"] = data[
+                            "group_member_welcome_enabled"
+                        ]
                     # Canned-notice overrides (soft_error/recovery/deny_non_owner).
                     # Must survive the load→save roundtrip of zalo_set_persona.
                     notices = data.get("notices")
@@ -4940,11 +5132,13 @@ def _zalo_reset_persona_handler(*args, **kwargs) -> Dict[str, Any]:
 # Valid chat-mode values.
 #   "default"      → fall back to global env (require_mention/observe etc.)
 #   "active"       → respond to every message (no mention required)
-#   "mention_only" → only respond when @-mentioned or reply-to-bot
+#   "active_mention_only" → observe every message, but only respond when
+#                            @-mentioned / name-mentioned / reply-to-bot
+#   "mention_only" → only respond when @-mentioned/name-mentioned or reply-to-bot
 #   "listen_only"  → observe & accumulate context but NEVER reply
 #   "mute"         → ignore everything from this chat (no observe, no reply)
 _VALID_CHAT_MODES = {
-    "default", "active", "mention_only", "listen_only", "mute",
+    "default", "active", "active_mention_only", "mention_only", "listen_only", "mute",
     # Sales mode — bot tự reply mọi tin trong group như nhân viên, có khả
     # năng tự gợi ý sản phẩm từ product_catalog.json khi phát hiện cơ hội.
     # Owner KHÔNG cần duyệt. Có safety guard: cooldown giữa các pitch, daily

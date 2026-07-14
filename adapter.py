@@ -2647,17 +2647,22 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
         # internal=True (bỏ qua authz + require_mention); câu trả lời của agent
         # được gửi vào group, "@All" được resolve ở đường outbound.
         _gn = group_name or "nhóm này"
+        _persona = _load_bot_persona()
+        _pname = (_persona.get("name") or "trợ lý").strip()
+        _pstyle = (_persona.get("personality") or "").strip()
         prompt = (
             "[SỰ KIỆN HỆ THỐNG — không phải tin của người dùng] "
+            f"Tên của bạn là {_pname}. PHONG CÁCH XƯNG HÔ BẮT BUỘC, áp cho CẢ lời chào này: {_pstyle} "
             f"Bạn vừa được thêm vào một nhóm Zalo tên \"{_gn}\". "
             "Hãy soạn ĐÚNG MỘT tin nhắn chào cả nhóm, thân thiện, ngắn gọn:\n"
             "• Dòng đầu bắt đầu bằng \"@All\" (giữ nguyên đúng chữ này để tag mọi người), "
             "kèm 1 emoji vẫy chào (ví dụ 👋).\n"
             "• Giới thiệu bản thân ngắn gọn.\n"
-            f"• Suy ra chủ đề nhóm từ tên \"{_gn}\" rồi nêu 2-3 việc bạn giúp được "
+            f"• Suy ra chủ đề nhóm từ tên \"{_gn}\" rồi nêu 3-4 việc bạn giúp được "
             "phù hợp chủ đề đó, MỖI việc xuống dòng riêng và bắt đầu bằng 1 emoji "
             "hợp ngữ cảnh (ví dụ 📈 💰 📅 🏸 📊 📝 …).\n"
-            "• Kết bằng lời mời mọi người tag tên bạn kèm câu hỏi để được hỗ trợ.\n"
+            "• Ngoài ra, gợi ý thêm vài tính năng người dùng hay dùng như: tạo file office, tạo ảnh, dịch thuật, tra cứu phạt nguội, giá vàng, lịch âm,...\n"
+            "• Kết bằng lời mời mọi người trong nhóm cứ nhắc tên/tag bạn kèm câu hỏi bất cứ lúc nào; ai cần hỗ trợ riêng thì cứ nhắn bạn, vì bạn hỗ trợ 24/7.\n"
             "YÊU CẦU TRÌNH BÀY: chèn emoji/icon hợp lý, chia thành các đoạn ngắn "
             "cách nhau bằng dòng trống cho thoáng, TRÁNH viết một khối chữ dồn dập. "
             "Đừng lạm dụng quá nhiều emoji (mỗi dòng tối đa 1-2 cái).\n"
@@ -3976,6 +3981,8 @@ _NON_OWNER_ALLOWED_TOOLS: set = {
     # Phong khi tool name o dang co dau cham -> base_name rut gon con "tao_*".
     "tao_hop_dong", "tao_docx", "tao_pdf", "tao_bao_gia",
     "tao_excel", "tao_pptx", "tao_van_ban", "ve_anh",
+    # RAG knowledge base — read-only, tra tài liệu công khai owner nạp (an toàn khách).
+    "mcp_rag_rag_search", "rag_search",
 }
 
 # Rate limit cho các tool gửi file (chống spam).

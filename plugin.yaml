@@ -54,3 +54,7 @@ optional_env:
     description: "Thread ID mặc định để cron/notification đẩy về."
     prompt: "Home thread"
     password: false
+  - name: ZALO_PERSONAL_NAME_TRIGGERS
+    description: "Tên gọi kích hoạt bot trong nhóm (phẩy ngăn cách, vd 'ông bụt,bụt'). Tin nhắn chứa một trong các tên này được coi như nhắc bot → bot reply dù không @tag (ở chế độ mention_only). Trống = chỉ @tag/reply mới kích hoạt."
+    prompt: "Name triggers"
+    password: false

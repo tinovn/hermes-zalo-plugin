@@ -54,6 +54,16 @@ _NOISY_STATUS_RE = re.compile(
     r"|auto-?compaction\s+was\s+raised"
     r"|caps\s+context\s+at"
     r"|compression\.\w*autoraise"
+    r"|compression\s+aborted"
+    r"|conversation\s+continues\s+unchanged"
+    r"|no\s+messages\s+were\s+dropped"
+    r"|start\s+a\s+fresh\s+session"
+    r"|run\s+/compress"
+    r"|/compress\s+to\s+retry"
+    r"|/new\s+to\s+start"
+    r"|total\s+timeout"
+    r"|auxiliary\s+\w+\s+stream"
+    r"|session\s+(?:was\s+)?automatically\s+reset"
     r"|invalid\s+responses"
     r"|trying\s+fallback"
     r"|home\s+channel\s+is\s+set"
@@ -97,7 +107,7 @@ _NOISY_STATUS_RE = re.compile(
 # carries a technical token (model/provider/stream/retry/api), drop it
 # even if no specific phrase matched. Catches future variants without
 # requiring a regex update each time.
-_STATUS_EMOJI_PREFIX_RE = re.compile(r"^\s*(?:⚠️|⏳|📬|🔄|🔁|❌|⛔|🛑|💥|💾|📝|🧠|🗒️|📋|🔧|⚙️|🔍|🗜️|⟳)")
+_STATUS_EMOJI_PREFIX_RE = re.compile(r"^\s*(?:⚠|ℹ️|ℹ|⚠️|⏳|📬|🔄|🔁|❌|⛔|🛑|💥|💾|📝|🧠|🗒️|📋|🔧|⚙️|🔍|🗜️|⟳)")
 _STATUS_TOKEN_RE = re.compile(
     r"\b(model|provider|stream|streaming|retry|retrying|api|connection|"
     r"timeout|reconnect|backend|chunk|ttfb|abort|fallback)\b",
@@ -185,6 +195,15 @@ def _datamark_user_text(text: str, nonce: str) -> str:
     return f"{open_tag}\n{text}\n{close_tag}"
 
 
+# Non-owner: tin MỞ ĐẦU bằng emoji/ký hiệu → luôn là thông báo Hermes
+# (⚠/ℹ/◐/🔄/💾/🗜...). Reply thật của bot (persona) mở đầu bằng chữ, không emoji.
+_LEADING_EMOJI_RE = re.compile(
+    r"^\s*(?:"
+    r"⚠|ℹ|◐|◑|◒|◓|◆|◇|⏳|⌛|📬|🔄|🔁|⟳|❌|⛔|🛑|💥|💾|🗜|🧠|🔧|⚙|🔍|📝|🗒|📋"
+    r")️?"
+)
+
+
 def _scrub_outgoing(text: str) -> Optional[str]:
     """Return cleaned text safe for end-user delivery, or None to drop.
 
@@ -206,6 +225,9 @@ def _scrub_outgoing(text: str) -> Optional[str]:
     if _NOISY_STATUS_RE.search(t):
         return None
     if _STATUS_EMOJI_PREFIX_RE.match(t) and _STATUS_TOKEN_RE.search(t):
+        return None
+    # Rule 3: mở đầu bằng emoji/ký hiệu → thông báo Hermes, drop cho khách.
+    if _LEADING_EMOJI_RE.match(t):
         return None
     # Mild brand redaction. Keep the message structure but swap names.
     t = _BRAND_REDACT_RE.sub("trợ lý", t)

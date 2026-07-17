@@ -1,7 +1,7 @@
 name: zalo-personal-platform
 label: Zalo (cá nhân)
 kind: platform
-version: 1.0.0
+version: 1.1.0
 description: >
   Adapter Zalo cá nhân cho Hermes Agent qua sidecar Node.js (zca-js).
   Dùng Zalo Web API không chính thức — KHUYẾN NGHỊ dùng SỐ PHỤ, không dùng số
@@ -57,4 +57,8 @@ optional_env:
   - name: ZALO_PERSONAL_NAME_TRIGGERS
     description: "Tên gọi kích hoạt bot trong nhóm (phẩy ngăn cách, vd 'ông bụt,bụt'). Tin nhắn chứa một trong các tên này được coi như nhắc bot → bot reply dù không @tag (ở chế độ mention_only). Trống = chỉ @tag/reply mới kích hoạt."
     prompt: "Name triggers"
+    password: false
+  - name: ZALO_IMAGE_URL_ALLOWED_HOSTS
+    description: "Host cho phép khi zalo_send_image tải ảnh từ image_url (phẩy ngăn cách). THAY THẾ mặc định 'mcp.tino.vn' — nếu set, PHẢI tự kèm mcp.tino.vn nếu vẫn cần gửi QR (không thì flow QR gãy). Chống SSRF: chỉ tải ảnh từ các host này."
+    prompt: "Allowed image URL hosts"
     password: false

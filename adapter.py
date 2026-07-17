@@ -445,6 +445,20 @@ _LandingMediaBridge = _lbridge.LandingMediaBridge
 _LandingBridgeError = _lbridge.BridgeError
 _load_landing_bridge_config = _lbridge.load_bridge_config
 
+# SSRF-guarded image fetch cho zalo_send_image(image_url=...) — model đưa 1 url
+# (vd qr_url từ media_store) → tải server-side, không cho base64/URL qua LLM.
+try:
+    from . import image_url_fetch as _imgfetch  # type: ignore
+except Exception:  # pragma: no cover
+    import importlib.util as _ilu4
+    _ifp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "image_url_fetch.py")
+    _spec_if = _ilu4.spec_from_file_location("zalo_image_url_fetch", _ifp)
+    _imgfetch = _ilu4.module_from_spec(_spec_if)
+    _spec_if.loader.exec_module(_imgfetch)
+_fetch_image_from_url = _imgfetch.fetch_image_from_url
+_ImageUrlError = _imgfetch.ImageUrlError
+_resolve_image_allowed_hosts = _imgfetch.resolve_allowed_hosts
+
 # Segment-aware outbound classifier (hide lifecycle/context diagnostics, keep
 # the real answer) + bounded terminal-recovery limiter.
 try:
@@ -6848,38 +6862,53 @@ def _image_bytes_look_complete(data: bytes, ext: str) -> bool:
 
 
 def _zalo_send_image_handler(args: Any = None, **kwargs) -> Dict[str, Any]:
-    """Decode a base64 image and send it as a REAL photo into the Zalo chat.
-    Same rate-limit/plumbing as the other zalo_send_* file tools. Non-owner OK.
-    The agent MUST call this instead of pasting the raw base64 string into a
-    text message (mã QR từ tao_qr, ảnh từ ve_anh, ...)."""
+    """Gửi ẢNH thật vào Zalo chat. Ảnh lấy từ MỘT trong hai nguồn:
+    - image_base64: chuỗi base64 (mã QR từ tao_qr, ảnh từ ve_anh...).
+    - image_url: link ảnh http NỘI BỘ (vd qr_url/url từ media_store mcp.tino.vn).
+      Adapter tải server-side (chỉ https + host cho phép, chống SSRF) — bytes/URL
+      KHÔNG lộ cho khách, base64 không phải đi qua LLM.
+    Same rate-limit/plumbing. Non-owner OK. TUYỆT ĐỐI KHÔNG dán base64/URL vào
+    tin nhắn text."""
     import base64 as _base64
 
     p = _extract_tool_params(args, kwargs)
     image_b64 = _coerce_str_arg(p.get("image_base64", ""))
-    if not image_b64.strip():
+    image_url = _coerce_str_arg(p.get("image_url", ""))
+
+    if image_b64.strip():
+        # Strip optional data URI prefix: data:image/png;base64,....
+        raw_b64 = image_b64.strip()
+        if raw_b64.startswith("data:"):
+            comma = raw_b64.find(",")
+            if comma != -1:
+                raw_b64 = raw_b64[comma + 1:]
+        # Remove whitespace/newlines that models sometimes insert.
+        raw_b64 = re.sub(r"\s+", "", raw_b64)
+        try:
+            data = _base64.b64decode(raw_b64, validate=False)
+        except Exception as e:
+            return {
+                "success": False,
+                "error": f"Chuỗi base64 không hợp lệ, không decode được ({e}).",
+            }
+    elif image_url.strip():
+        # Tải ảnh server-side với allowlist host (mặc định mcp.tino.vn) + chống
+        # SSRF/redirect. env ZALO_IMAGE_URL_ALLOWED_HOSTS mở rộng nếu cần.
+        allowed = _resolve_image_allowed_hosts(os.environ.get("ZALO_IMAGE_URL_ALLOWED_HOSTS"))
+        try:
+            data, _ = _fetch_image_from_url(image_url.strip(), allowed_hosts=allowed)
+        except _ImageUrlError as e:
+            return {"success": False, "error": f"Không lấy được ảnh từ image_url: {e}."}
+        except Exception as e:  # noqa: BLE001
+            return {"success": False, "error": f"Lỗi tải ảnh từ image_url: {e}."}
+    else:
         return {
             "success": False,
-            "error": "Thiếu image_base64. Truyền chuỗi ảnh base64 (QR/ảnh) vào tham số này.",
+            "error": "Thiếu ảnh: truyền image_base64 HOẶC image_url (1 trong 2).",
         }
 
-    # Strip optional data URI prefix: data:image/png;base64,....
-    raw_b64 = image_b64.strip()
-    if raw_b64.startswith("data:"):
-        comma = raw_b64.find(",")
-        if comma != -1:
-            raw_b64 = raw_b64[comma + 1:]
-    # Remove whitespace/newlines that models sometimes insert.
-    raw_b64 = re.sub(r"\s+", "", raw_b64)
-
-    try:
-        data = _base64.b64decode(raw_b64, validate=False)
-    except Exception as e:
-        return {
-            "success": False,
-            "error": f"Chuỗi base64 không hợp lệ, không decode được ({e}).",
-        }
     if not data:
-        return {"success": False, "error": "Ảnh rỗng sau khi decode base64."}
+        return {"success": False, "error": "Ảnh rỗng sau khi decode/tải."}
     if len(data) > 10_485_760:
         return {"success": False, "error": "Ảnh quá lớn (>10MB), không gửi được."}
 
@@ -6889,7 +6918,7 @@ def _zalo_send_image_handler(args: Any = None, **kwargs) -> Dict[str, Any]:
             "success": False,
             "error": (
                 "Dữ liệu không phải ảnh hợp lệ hoặc bị cắt dở (chỉ nhận "
-                "PNG/JPEG/GIF/WebP đầy đủ). Kiểm tra lại chuỗi base64 nguồn."
+                "PNG/JPEG/GIF/WebP đầy đủ). Kiểm tra lại nguồn ảnh (base64/URL)."
             ),
         }
 
@@ -9985,19 +10014,29 @@ def _register_zalo_tools(ctx) -> None:
                 "function": {
                     "name": "zalo_send_image",
                     "description": (
-                        "Gửi ẢNH cho khách từ dữ liệu base64 (mã QR từ "
-                        "tao_qr, ảnh từ ve_anh). BẮT BUỘC dùng khi có ảnh "
-                        "base64 — TUYỆT ĐỐI KHÔNG dán chuỗi base64 vào tin "
-                        "nhắn."
+                        "Gửi ẢNH cho khách. Truyền MỘT trong hai: `image_url` "
+                        "(ƯU TIÊN — link ảnh nội bộ như qr_url/url từ media_store "
+                        "mcp.tino.vn; adapter tự tải, KHÔNG phình context) hoặc "
+                        "`image_base64` (mã QR/ảnh dạng base64). TUYỆT ĐỐI KHÔNG "
+                        "dán chuỗi base64 hay URL vào tin nhắn text."
                     ),
                     "parameters": {
                         "type": "object",
                         "properties": {
+                            "image_url": {
+                                "type": "string",
+                                "description": (
+                                    "Link ảnh https NỘI BỘ (vd qr_url/url từ "
+                                    "get_payment_qr/tao_qr — host mcp.tino.vn). "
+                                    "Ưu tiên dùng cái này thay vì base64."
+                                ),
+                            },
                             "image_base64": {
                                 "type": "string",
                                 "description": (
                                     "Chuỗi ảnh base64 (có/không tiền tố "
-                                    "`data:image/...;base64,`). PNG/JPEG/GIF/WebP."
+                                    "`data:image/...;base64,`). PNG/JPEG/GIF/WebP. "
+                                    "Chỉ dùng khi KHÔNG có url."
                                 ),
                             },
                             "caption": {
@@ -10009,7 +10048,7 @@ def _register_zalo_tools(ctx) -> None:
                                 "description": "Chat/group ID. Bỏ trống = gửi chat hiện tại.",
                             },
                         },
-                        "required": ["image_base64"],
+                        "required": [],
                     },
                 },
             },

@@ -2304,6 +2304,16 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
             "Nếu họ chưa rõ định dạng → HỎI LẠI 1 câu (\"Anh/chị muốn HTML, "
             "PDF, PowerPoint hay Excel ạ?\"). Rate limit 5 file/giờ/người, "
             "vượt quota tool trả lỗi → báo lại lịch sự.\n"
+            "8. ĐƯỢC đặt nhắc hẹn giúp người dùng — tool zalo_create_reminder("
+            "title, at='YYYY-MM-DD HH:MM' HOẶC in_minutes=N, repeat=none/daily/"
+            "weekly/monthly). Đây là nhắc hẹn NATIVE hiện trên bảng tin Zalo "
+            "của ĐÚNG nhóm/chat hiện tại. VD: \"5 phút nữa nhắc tôi gọi khách\" "
+            "→ zalo_create_reminder(title='Gọi khách', in_minutes=5); \"nhắc "
+            "9h mai họp\" → zalo_create_reminder(title='Họp', at='<mai> 09:00'). "
+            "TUYỆT ĐỐI KHÔNG dùng cron (tool nội bộ, chỉ sếp) — với người này "
+            "CHỈ dùng zalo_create_reminder. Chỉ đặt cho nhóm/chat hiện tại "
+            "(không đặt hộ nhóm khác). Rate limit 3 nhắc/giờ/người; vượt quota "
+            "tool trả lỗi → báo lại lịch sự.\n"
             "═════════════════════════════════════════"
             + persona_block
             + datamark_block
@@ -4176,10 +4186,14 @@ _NON_OWNER_BLOCKED_TOOLS: set = {
     # zalo_list_products is read-only; safe but still owner-only to avoid
     # leaking the product list to random group members.
     "zalo_list_products",
-    # zca-js passthrough tools — owner-only. Poll/note/reminder thay đổi
-    # nội dung nhóm; friend_accept đổi danh bạ; api_call là power tool
-    # gọi được MỌI method zca-js (nguy hiểm nếu non-owner điều khiển).
-    "zalo_create_poll", "zalo_create_note", "zalo_create_reminder",
+    # zca-js passthrough tools — owner-only. Poll/note thay đổi nội dung
+    # nhóm; friend_accept đổi danh bạ; api_call là power tool gọi được MỌI
+    # method zca-js (nguy hiểm nếu non-owner điều khiển).
+    # NB: zalo_create_reminder CỐ TÌNH KHÔNG nằm đây — đã mở cho non-owner
+    # (xem _NON_OWNER_ALLOWED_TOOLS): nhắc hẹn native bó cứng vào chat hiện
+    # tại, cross-chat bị chặn + rate-limit ở cổng, không đụng file/shell.
+    # Vẫn KHÁC cron Hermes (power tool, giữ owner-only).
+    "zalo_create_poll", "zalo_create_note",
     "zalo_board_action", "zalo_friend_accept", "zalo_api_call",
 }
 
@@ -4194,6 +4208,11 @@ _NON_OWNER_ALLOWED_TOOLS: set = {
     "zalo_send_html", "zalo_send_pptx", "zalo_send_pdf", "zalo_send_xlsx",
     "zalo_send_image", "zalo_send_file",
     "zalo_escalate_to_owner",
+    # Nhắc hẹn NATIVE Zalo cho non-owner (nhân viên/khách tự đặt lịch nhắc).
+    # An toàn: chỉ tạo reminder trên bảng tin của ĐÚNG chat hiện tại — cổng
+    # non-owner chặn cross-chat + rate-limit chống spam (xem nhánh xử lý
+    # riêng bên dưới). KHÁC cron Hermes (power tool, vẫn owner-only).
+    "zalo_create_reminder",
     # Đọc ảnh gần nhất: an toàn — handler ÉP scope vào chat hiện tại của
     # task (không peek chat khác), chỉ trả path ảnh đã cache của chính chat đó.
     "zalo_read_recent_image",
@@ -4301,6 +4320,35 @@ def _bump_file_send_quota(chat_id: str, user_id: str) -> None:
         rec["count"] = rec.get("count", 0) + 1
         by_user[user_id] = rec
     _save_file_send_state(state)
+
+
+# ── Quota theo giờ dùng chung (chống spam) ─────────────────────────────────
+# Tách sang module rate_limit.py (dep-free) để test độc lập không cần import cả
+# gateway; tái dùng cho nhắc hẹn non-owner mà KHÔNG đụng đường gửi file (8
+# call-site) đã chạy ổn định. Cùng chiến lược load kép như marketing/…: package
+# trước, fallback file khi chạy lẻ.
+try:
+    from . import rate_limit as _ratelimit  # type: ignore
+except Exception:  # pragma: no cover
+    import importlib.util as _ilu_rl
+    _rlp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rate_limit.py")
+    _spec_rl = _ilu_rl.spec_from_file_location("zalo_rate_limit", _rlp)
+    _ratelimit = _ilu_rl.module_from_spec(_spec_rl)
+    _spec_rl.loader.exec_module(_ratelimit)
+_hourly_quota_check = _ratelimit.check
+_hourly_quota_bump = _ratelimit.bump
+
+
+# Non-owner đặt nhắc hẹn native: giới hạn chống spam (reminder ping cả nhóm).
+_REMINDER_PER_CHAT_HOUR = 6
+_REMINDER_PER_USER_HOUR = 3
+_REMINDER_STATE_FILENAME = "reminder_create_state.json"
+
+
+def _reminder_state_path() -> Path:
+    return Path(
+        os.getenv("ZALO_PERSONAL_SESSION_DIR") or "/opt/data/zalo"
+    ) / _REMINDER_STATE_FILENAME
 
 
 def _maybe_install_file_packages() -> Dict[str, bool]:
@@ -4602,6 +4650,39 @@ def _zalo_pre_tool_call_hook(
                         "không xem được nội dung nhóm khác."
                     ),
                 }
+        if base_name == "zalo_create_reminder":
+            # Nhắc hẹn native cho non-owner: (a) CHỈ đúng chat hiện tại (chống
+            # đặt nhắc hộ nhóm khác), (b) rate-limit chống spam ping cả nhóm.
+            try:
+                p = _extract_tool_params(args, kwargs)
+            except Exception:
+                p = {}
+            req_chat = (
+                _coerce_str_arg(p.get("chat_id", "")) if isinstance(p, dict) else ""
+            )
+            if req_chat and current_chat_id and req_chat != current_chat_id:
+                logger.warning(
+                    f"[zalo-personal] BLOCKED create_reminder cross-chat: "
+                    f"requested={req_chat} current_chat={current_chat_id} "
+                    f"user_id={user_id} (session {session_id})"
+                )
+                return {
+                    "action": "block",
+                    "message": (
+                        "Em chỉ đặt nhắc được cho đúng nhóm/chat mình đang trò "
+                        "chuyện thôi ạ, không đặt hộ nhóm khác được."
+                    ),
+                }
+            quota_err = _hourly_quota_check(
+                _reminder_state_path(), current_chat_id, user_id,
+                _REMINDER_PER_CHAT_HOUR, _REMINDER_PER_USER_HOUR,
+                f"Nhóm này đã đặt đủ {_REMINDER_PER_CHAT_HOUR} nhắc trong 1 tiếng.",
+                f"Bạn đã đặt đủ {_REMINDER_PER_USER_HOUR} nhắc trong 1 tiếng.",
+            )
+            if quota_err:
+                return {"action": "block", "message": quota_err + " Đợi chút rồi thử lại nha."}
+            _hourly_quota_bump(_reminder_state_path(), current_chat_id, user_id)
+            return None
         return None
 
     # Mọi tool còn lại: từ chối. Phân biệt log "known-blocked" với "unknown"

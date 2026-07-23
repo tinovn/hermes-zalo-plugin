@@ -473,6 +473,22 @@ except Exception:  # pragma: no cover
     _imgfetch = _ilu4.module_from_spec(_spec_if)
     _spec_if.loader.exec_module(_imgfetch)
 _fetch_image_from_url = _imgfetch.fetch_image_from_url
+
+# Nhắc động kiểu Osin cho non-owner: scheduler (persist/due/escalation) +
+# compose (LLM toolless + template fallback). Dep-free → load kép như trên.
+try:
+    from . import reminder_scheduler as _rsched  # type: ignore
+    from . import reminder_compose as _rcompose  # type: ignore
+except Exception:  # pragma: no cover
+    import importlib.util as _ilu_rem
+    _rsp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reminder_scheduler.py")
+    _spec_rs = _ilu_rem.spec_from_file_location("zalo_reminder_scheduler", _rsp)
+    _rsched = _ilu_rem.module_from_spec(_spec_rs)
+    _spec_rs.loader.exec_module(_rsched)
+    _rcp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reminder_compose.py")
+    _spec_rc = _ilu_rem.spec_from_file_location("zalo_reminder_compose", _rcp)
+    _rcompose = _ilu_rem.module_from_spec(_spec_rc)
+    _spec_rc.loader.exec_module(_rcompose)
 _ImageUrlError = _imgfetch.ImageUrlError
 _resolve_image_allowed_hosts = _imgfetch.resolve_allowed_hosts
 
@@ -1069,6 +1085,12 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
         # Vòng nền nhỏ giọt cho phễu marketing (kết bạn / nhắn tin theo hàng
         # đợi đã duyệt, rải đều 24h, tôn trọng hạn mức/ngày).
         self._mkt_drip_task = asyncio.create_task(self._marketing_drip_loop())
+        # Vòng nền cho nhắc ĐỘNG non-owner: tới giờ bắn tin chat + tag. State
+        # persist trên đĩa → sống qua restart (reload ở đầu vòng). Guard tránh
+        # tạo 2 loop nếu connect() được gọi lại mà chưa disconnect (double-fire).
+        _rt = getattr(self, "_reminder_tick_task", None)
+        if _rt is None or _rt.done():
+            self._reminder_tick_task = asyncio.create_task(self._reminder_tick_loop())
         # Kick off group history backfill in background — doesn't block
         # gateway startup. Skips silently if no groups have been seen yet.
         if os.getenv("ZALO_PERSONAL_BACKFILL_ON_START", "true").lower() in (
@@ -1390,6 +1412,73 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.warning(f"[zalo-mkt] drip loop: {e}")
             await asyncio.sleep(60)
+
+    def _reminder_block_names(self) -> list:
+        """Tên/nickname sếp để defang khỏi nhắc non-owner (không cho tag sếp
+        theo lịch). _build_outbound_mentions còn resolve owner_user_display →
+        chặn cả tên đó."""
+        names = []
+        for nm in (
+            getattr(self, "owner_user_display", ""),
+            _OWNER_NAME,
+            _OWNER_NICKNAME,
+        ):
+            nm = nm.strip() if isinstance(nm, str) else ""
+            if nm and nm not in names:
+                names.append(nm)
+        return names
+
+    async def _reminder_llm_call(self, messages):
+        """Completion TOOLLESS quanh core Hermes async_call_llm (import lazy).
+        KHÔNG agent, KHÔNG tool → không thể chạm tool nguy hiểm/tự sinh nhắc.
+        Lỗi/aux thiếu → raise → compose tự fallback template."""
+        from agent.auxiliary_client import async_call_llm  # lazy: chỉ khi nổ
+        return await async_call_llm(
+            messages=messages, temperature=0.7, max_tokens=300, timeout=30,
+        )
+
+    async def _reminder_tick_loop(self):
+        """Mỗi ~30s bắn các nhắc động tới giờ (tin chat + tag). State persist →
+        sống qua restart. 1 reminder lỗi KHÔNG làm chết vòng lặp. Quá hạn >30'
+        (offline) → bỏ, tránh spam burst khi gateway vừa bật lại."""
+        path = _rsched.state_path()
+        grace = 1800.0
+        await asyncio.sleep(15)  # trễ khởi động cho sidecar ổn định
+        while not self._stop:
+            try:
+                now = time.time()
+                state = _rsched.load(path)
+                for rec in _rsched.due(state, now):
+                    rid = rec.get("id")
+                    advanced = False
+                    try:
+                        if _rsched.is_overdue(rec, now, grace):
+                            logger.info(
+                                f"[zalo-reminder] bỏ nhắc quá hạn {rid} "
+                                f"(trễ >{int(grace)}s, gateway offline)"
+                            )
+                            _rsched.advance(path, rid)
+                            continue
+                        text = await _rcompose.compose(rec, now, self._reminder_llm_call)
+                        # Chặn non-owner ping cả nhóm (@All) / tag sếp theo lịch,
+                        # kể cả khi lọt qua field task (injection).
+                        text = _rcompose.defang_mentions(text, self._reminder_block_names())
+                        # advance TRƯỚC khi gửi → gửi lỗi cũng không re-fire spam.
+                        _rsched.advance(path, rid)
+                        advanced = True
+                        if text and text.strip():
+                            # send() tự lọc (_scrub_outgoing + redaction) + build @mention
+                            await self.send(str(rec.get("chat_id")), text)
+                    except Exception as e:
+                        logger.warning(f"[zalo-reminder] fire {rid} lỗi: {e}")
+                        if not advanced:
+                            try:
+                                _rsched.advance(path, rid)
+                            except Exception:
+                                pass
+            except Exception as e:
+                logger.warning(f"[zalo-reminder] tick loop: {e}")
+            await asyncio.sleep(30)
 
     async def _mk_maybe_autoaccept(self, event: Dict[str, Any]):
         """Khi bật auto_accept: cố trích uid người gửi lời mời từ payload
@@ -2331,6 +2420,14 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
             "CHỈ dùng zalo_create_reminder. Chỉ đặt cho nhóm/chat hiện tại "
             "(không đặt hộ nhóm khác). Rate limit 3 nhắc/giờ/người; vượt quota "
             "tool trả lỗi → báo lại lịch sự.\n"
+            "9. ĐƯỢC đặt LỊCH NHẮC CÓ TAG trong NHÓM — tool zalo_schedule_reminder("
+            "task, target='TênNgười' (để tag), in_minutes=N HOẶC at='YYYY-MM-DD HH:MM'; "
+            "tùy chọn deadline + max_attempts để nhắc leo thang tới hạn). Tới giờ em TỰ "
+            "NHẮN tin trong nhóm, tag @người đó. Dùng khi có người nhờ nhắc AI ĐÓ làm gì "
+            "đúng giờ, vd \"5 phút nữa nhắc @Trân nộp bài\" → zalo_schedule_reminder("
+            "task='nộp bài', target='Trân', in_minutes=5). KHÁC mục 8 (zalo_create_reminder "
+            "chỉ hiện trên bảng tin, KHÔNG nhắn + tag). TUYỆT ĐỐI KHÔNG dùng cron. CHỈ trong "
+            "NHÓM và chỉ nhóm hiện tại. Rate limit 3 nhắc/giờ/người.\n"
             "═════════════════════════════════════════"
             + persona_block
             + datamark_block
@@ -4230,6 +4327,11 @@ _NON_OWNER_ALLOWED_TOOLS: set = {
     # non-owner chặn cross-chat + rate-limit chống spam (xem nhánh xử lý
     # riêng bên dưới). KHÁC cron Hermes (power tool, vẫn owner-only).
     "zalo_create_reminder",
+    # Nhắc ĐỘNG kiểu Osin cho non-owner: đặt lịch → tới giờ bot bắn TIN CHAT
+    # trong nhóm, tag @người, nội dung soạn bằng LLM TOOLLESS lúc nổ (không
+    # agent, không chạm tool nào → zero tool exposure, không amplification).
+    # Guards ở cổng: group-only + current-chat + rate-limit. KHÁC cron Hermes.
+    "zalo_schedule_reminder",
     # Đọc ảnh gần nhất: an toàn — handler ÉP scope vào chat hiện tại của
     # task (không peek chat khác), chỉ trả path ảnh đã cache của chính chat đó.
     "zalo_read_recent_image",
@@ -4366,6 +4468,19 @@ def _reminder_state_path() -> Path:
     return Path(
         os.getenv("ZALO_PERSONAL_SESSION_DIR") or "/opt/data/zalo"
     ) / _REMINDER_STATE_FILENAME
+
+
+# Nhắc ĐỘNG (zalo_schedule_reminder): quota riêng, KHÔNG dùng chung với native
+# reminder ở trên (2 tính năng khác nhau). Ping cả nhóm → siết tương tự.
+_SCHEDULE_REMINDER_PER_CHAT_HOUR = 6
+_SCHEDULE_REMINDER_PER_USER_HOUR = 3
+_SCHEDULE_REMINDER_QUOTA_FILENAME = "reminder_schedule_quota.json"
+
+
+def _schedule_reminder_quota_path() -> Path:
+    return Path(
+        os.getenv("ZALO_PERSONAL_SESSION_DIR") or "/opt/data/zalo"
+    ) / _SCHEDULE_REMINDER_QUOTA_FILENAME
 
 
 def _maybe_install_file_packages() -> Dict[str, bool]:
@@ -4699,6 +4814,47 @@ def _zalo_pre_tool_call_hook(
             if quota_err:
                 return {"action": "block", "message": quota_err + " Đợi chút rồi thử lại nha."}
             _hourly_quota_bump(_reminder_state_path(), current_chat_id, user_id)
+            return None
+        if base_name == "zalo_schedule_reminder":
+            # Nhắc ĐỘNG (tin chat + tag): (a) chỉ NHÓM (tag vô nghĩa ở DM),
+            # (b) chỉ chat hiện tại, (c) rate-limit riêng chống spam ping.
+            if _infer_zalo_thread_type(current_chat_id) != "group":
+                return {
+                    "action": "block",
+                    "message": (
+                        "Nhắc kèm tag chỉ dùng trong NHÓM ạ. Ở chat riêng, anh/chị "
+                        "dùng 'đặt nhắc hẹn Zalo' nha."
+                    ),
+                }
+            try:
+                p = _extract_tool_params(args, kwargs)
+            except Exception:
+                p = {}
+            req_chat = (
+                _coerce_str_arg(p.get("chat_id", "")) if isinstance(p, dict) else ""
+            )
+            if req_chat and current_chat_id and req_chat != current_chat_id:
+                logger.warning(
+                    f"[zalo-personal] BLOCKED schedule_reminder cross-chat: "
+                    f"requested={req_chat} current_chat={current_chat_id} "
+                    f"user_id={user_id} (session {session_id})"
+                )
+                return {
+                    "action": "block",
+                    "message": (
+                        "Em chỉ đặt nhắc cho đúng nhóm mình đang trò chuyện thôi ạ, "
+                        "không đặt hộ nhóm khác được."
+                    ),
+                }
+            quota_err = _hourly_quota_check(
+                _schedule_reminder_quota_path(), current_chat_id, user_id,
+                _SCHEDULE_REMINDER_PER_CHAT_HOUR, _SCHEDULE_REMINDER_PER_USER_HOUR,
+                f"Nhóm này đã đặt đủ {_SCHEDULE_REMINDER_PER_CHAT_HOUR} nhắc trong 1 tiếng.",
+                f"Bạn đã đặt đủ {_SCHEDULE_REMINDER_PER_USER_HOUR} nhắc trong 1 tiếng.",
+            )
+            if quota_err:
+                return {"action": "block", "message": quota_err + " Đợi chút rồi thử lại nha."}
+            _hourly_quota_bump(_schedule_reminder_quota_path(), current_chat_id, user_id)
             return None
         return None
 
@@ -8225,6 +8381,118 @@ def _zalo_create_reminder_handler(args: Any = None, **kwargs) -> Dict[str, Any]:
             "hint": "Nhắc hẹn đã tạo trên Zalo. Báo NGẮN gọn kèm thời gian nhắc."}
 
 
+def _parse_vn_epoch(s: str) -> Optional[float]:
+    """'YYYY-MM-DD HH:MM' (giờ VN) → epoch giây. None nếu sai định dạng."""
+    s = (s or "").strip()
+    if not s:
+        return None
+    import datetime
+    from zoneinfo import ZoneInfo
+    _tz_vn = ZoneInfo("Asia/Ho_Chi_Minh")
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%d/%m/%Y %H:%M", "%H:%M"):
+        try:
+            dt = datetime.datetime.strptime(s, fmt)
+            if fmt == "%H:%M":  # chỉ giờ → hôm nay (giờ VN); nếu đã qua → mai
+                today = datetime.datetime.now(_tz_vn)
+                dt = dt.replace(
+                    year=today.year, month=today.month, day=today.day, tzinfo=_tz_vn
+                )
+                if dt.timestamp() <= today.timestamp():
+                    dt = dt + datetime.timedelta(days=1)
+                return dt.timestamp()
+            dt = dt.replace(tzinfo=_tz_vn)
+            return dt.timestamp()
+        except ValueError:
+            continue
+    return None
+
+
+def _zalo_schedule_reminder_handler(args: Any = None, **kwargs) -> Dict[str, Any]:
+    """Đặt nhắc ĐỘNG kiểu Osin trong NHÓM: tới giờ bot bắn TIN CHAT tag @người,
+    nội dung soạn bằng LLM toolless lúc nổ (fallback template). Escalation nhiều
+    lần nếu có 'deadline' + 'max_attempts'. Chỉ dùng trong nhóm.
+    (Guards group-only/current-chat/rate-limit đã ép ở cổng non-owner.)"""
+    import uuid
+    p = _extract_tool_params(args, kwargs)
+    chat_id = _tool_chat_id(p, kwargs)
+    task = _coerce_str_arg(p.get("task", "")) or _coerce_str_arg(p.get("title", ""))
+    target = (
+        _coerce_str_arg(p.get("target", ""))
+        or _coerce_str_arg(p.get("who", ""))
+        or _coerce_str_arg(p.get("target_display", ""))
+    )
+    if not chat_id or not task:
+        return {"success": False, "error": "chat_id và task (việc cần nhắc) required"}
+    if _infer_zalo_thread_type(chat_id) != "group":
+        return {"success": False, "error": "Nhắc kèm tag chỉ đặt được trong nhóm."}
+
+    now = time.time()
+    # Thời điểm bắt đầu nhắc: 'at' (YYYY-MM-DD HH:MM giờ VN) hoặc in_minutes.
+    at_str = _coerce_str_arg(p.get("at", ""))
+    start_at: Optional[float] = None
+    if at_str:
+        start_at = _parse_vn_epoch(at_str)
+        if start_at is None:
+            return {"success": False, "error": "at sai định dạng 'YYYY-MM-DD HH:MM'"}
+    else:
+        try:
+            mins = float(p.get("in_minutes") or 0)
+        except Exception:
+            mins = 0
+        if mins > 0:
+            start_at = now + mins * 60
+    if not start_at or start_at <= now - 60:
+        return {"success": False, "error": "Cần thời điểm: 'in_minutes' (N phút nữa) hoặc 'at' 'YYYY-MM-DD HH:MM'."}
+
+    # Hạn chót (tùy chọn) → cho phép escalation nhiều lần tới hạn.
+    deadline_at: Optional[float] = None
+    dl_str = _coerce_str_arg(p.get("deadline", ""))
+    if dl_str:
+        deadline_at = _parse_vn_epoch(dl_str)
+    elif p.get("deadline_in_minutes"):
+        try:
+            dmins = float(p.get("deadline_in_minutes") or 0)
+        except Exception:
+            dmins = 0
+        if dmins > 0:
+            deadline_at = now + dmins * 60
+
+    try:
+        max_att = int(p.get("max_attempts") or (3 if deadline_at else 1))
+    except Exception:
+        max_att = 3 if deadline_at else 1
+    max_att = max(1, min(5, max_att))
+
+    fire_times = _rsched.compute_fire_times(start_at, deadline_at, max_att)
+    rec = {
+        "id": uuid.uuid4().hex[:12],
+        "chat_id": str(chat_id),
+        "thread_type": "group",
+        "task": task,
+        "target_display": target,
+        "fire_times": fire_times,
+        "next_idx": 0,
+        "max_attempts": len(fire_times),
+        "deadline_at": deadline_at,
+        "created_by_uid": _coerce_str_arg(kwargs.get("user_id", "")),
+        "created_at": now,
+    }
+    try:
+        _rsched.add(_rsched.state_path(), rec)
+    except Exception as e:
+        logger.warning(f"[zalo-personal] schedule_reminder add failed: {e}")
+        return {"success": False, "error": "Không lưu được lịch nhắc, thử lại nha."}
+    return {
+        "success": True,
+        "reminder_id": rec["id"],
+        "attempts": len(fire_times),
+        "hint": (
+            "Đã đặt lịch nhắc trong nhóm. Tới giờ em sẽ tự nhắn tag người đó. "
+            "Báo NGẮN gọn cho người dùng (thời điểm + tên người được nhắc)."
+        ),
+    }
+
+
 def _zalo_board_action_handler(args: Any = None, **kwargs) -> Dict[str, Any]:
     """Thao tác bảng tin nhóm: list / poll_detail / poll_lock / poll_vote /
     note_edit / reminder_remove / reminder_list."""
@@ -10477,6 +10745,26 @@ def _register_zalo_tools(ctx) -> None:
                                "description": "Lặp lại"}},
                     "required": ["title"]}}},
             handler=_zalo_create_reminder_handler, description="Tạo nhắc hẹn Zalo.", emoji="⏰")
+        ctx.register_tool(
+            name="zalo_schedule_reminder", toolset="hermes-zalo",
+            schema={"type": "function", "function": {
+                "name": "zalo_schedule_reminder",
+                "description": (
+                    "Đặt LỊCH NHẮC trong NHÓM: tới giờ bot tự gửi TIN NHẮN nhắc, tag @người. "
+                    "Dùng khi có người nhờ nhắc ai đó làm gì đúng giờ (vd '5 phút nữa nhắc "
+                    "@Trân nộp bài', 'nhắc mọi người 8h họp'). Nội dung nhắc bot tự soạn lúc gửi. "
+                    "Có thể escalation nhiều lần nếu kèm 'deadline' + 'max_attempts'. CHỈ trong nhóm."),
+                "parameters": {"type": "object", "properties": {
+                    "task": {"type": "string", "description": "Việc cần nhắc (vd 'nộp bài')"},
+                    "target": {"type": "string", "description": "Tên hiển thị người được nhắc để tag (@). Bỏ trống = nhắc chung."},
+                    "in_minutes": {"type": "number", "description": "Nhắc sau N phút"},
+                    "at": {"type": "string", "description": "Hoặc thời điểm 'YYYY-MM-DD HH:MM' (giờ VN)"},
+                    "deadline": {"type": "string", "description": "Hạn chót 'YYYY-MM-DD HH:MM' (tùy chọn, để escalation)"},
+                    "deadline_in_minutes": {"type": "number", "description": "Hoặc hạn chót sau N phút"},
+                    "max_attempts": {"type": "number", "description": "Số lần nhắc leo thang tới hạn (1-5, mặc định 3 nếu có deadline)"}},
+                    "required": ["task"]}}},
+            handler=_zalo_schedule_reminder_handler,
+            description="Đặt lịch nhắc tag người trong nhóm.", emoji="⏰")
         ctx.register_tool(
             name="zalo_board_action", toolset="hermes-zalo",
             schema={"type": "function", "function": {

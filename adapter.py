@@ -204,6 +204,19 @@ _LEADING_EMOJI_RE = re.compile(
 )
 
 
+# Reply thật của bot LUÔN tiếng Việt (ta/con). Đôi khi model lỡ xuất văn bản
+# PLANNING tiếng Anh ("We need... Let's call get latest to inspect...") ra chat.
+_VN_DIACRITIC_RE = re.compile(
+    r"[àáảãạăằắẳẵặâầấẩẫậèéẻẽẹêềếểễệìíỉĩịòóỏõọôồốổỗộơờớởỡợùúủũụưừứửữựỳýỷỹỵđ]",
+    re.IGNORECASE,
+)
+_MODEL_PLANNING_RE = re.compile(
+    r"(?i)(?:let'?s\s+\w+|let\s+me\s+\w+|we\s+(?:need|should|must|can|have\s+to)"
+    r"|i'?ll\s+\w+|i\s+need\s+to|i\s+should|call\s+get|get\s+latest|update\s+fields"
+    r"|maybe\s+enough|possibly\s+forbidden|to\s+inspect|first\s+and\s+html)"
+)
+
+
 def _scrub_outgoing(text: str) -> Optional[str]:
     """Return cleaned text safe for end-user delivery, or None to drop.
 
@@ -228,6 +241,10 @@ def _scrub_outgoing(text: str) -> Optional[str]:
         return None
     # Rule 3: mở đầu bằng emoji/ký hiệu → thông báo Hermes, drop cho khách.
     if _LEADING_EMOJI_RE.match(t):
+        return None
+    # Rule 4: model reasoning/planning tiếng Anh lọt ra (không có tiếng Việt +
+    # dính >=2 mẫu planning). Reply thật luôn tiếng Việt → an toàn.
+    if not _VN_DIACRITIC_RE.search(t) and len(_MODEL_PLANNING_RE.findall(t)) >= 2:
         return None
     # Mild brand redaction. Keep the message structure but swap names.
     t = _BRAND_REDACT_RE.sub("trợ lý", t)

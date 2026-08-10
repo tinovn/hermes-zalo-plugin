@@ -2195,15 +2195,12 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
             aliases.extend([
                 chat_persona.get("name", ""),
                 persona.get("name", ""),
-                "Ông Bụt AI",
-                "Ông Bụt Ai",
-                "Bụt AI",
             ])
         except Exception:
-            aliases.extend(["Ông Bụt AI", "Ông Bụt Ai", "Bụt AI"])
+            pass
         # Tên gọi cấu hình qua ENV (ZALO_PERSONAL_NAME_TRIGGERS) — bổ sung vào
-        # alias, cho phép gọi bot bằng biệt danh ngắn ("bụt", "ông bụt ơi") mà
-        # persona name (thường dài, vd "Ông Bụt AI") không bắt được.
+        # alias, cho phép gọi bot bằng biệt danh ngắn ("bụt", "sếp ơi") mà
+        # persona name (thường dài) không bắt được.
         aliases.extend(getattr(self, "name_triggers", []))
         for alias in aliases:
             if isinstance(alias, str) and alias.strip() and alias.strip().lower() in text_l:
@@ -2922,10 +2919,14 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
             return
         template = str(persona.get("group_welcome_text") or "").strip()
         if not template:
+            # Không hardcode tên/xưng hô của một persona cụ thể: lấy tên từ
+            # bot_persona.json (owner đổi được qua zalo_set_persona), giọng
+            # trung tính. Owner muốn khác thì đặt `group_welcome_text`.
+            pname = str(persona.get("name") or "").strip() or "trợ lý ảo"
             template = (
                 "@All 👋 Chào mừng {member_names} vào nhóm {group_name} nha!\n\n"
-                "Ta là Ông Bụt AI — trợ lý ảo của nhóm. Con cứ tag ta kèm câu hỏi "
-                "hoặc yêu cầu cụ thể, ta xử lý cho nhanh gọn nha."
+                f"Mình là {pname}. Mọi người cứ tag mình kèm câu hỏi hoặc yêu "
+                "cầu cụ thể, mình xử lý cho nhanh gọn nha."
             )
         rendered = self._render_group_welcome_template(
             template, group_name=group_name, member_names=new_names
@@ -9650,7 +9651,7 @@ def _register_zalo_tools(ctx) -> None:
                                     "Các CÂU HỆ THỐNG gửi thẳng ra khách (không qua "
                                     "model) — PHẢI khớp xưng hô persona. Khi owner đổi "
                                     "persona/xưng hô, LUÔN tự soạn lại 3 câu này đúng "
-                                    "giọng mới (vd persona Ông Bụt: 'Con chờ ta một "
+                                    "giọng mới (vd persona xưng ta/con: 'Con chờ ta một "
                                     "chút, ta kiểm tra lại cho rõ rồi báo con ngay.'). "
                                     "Mỗi câu ngắn gọn, <=300 ký tự, thuần trấn an."
                                 ),

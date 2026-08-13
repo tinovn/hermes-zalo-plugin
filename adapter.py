@@ -107,7 +107,9 @@ _NOISY_STATUS_RE = re.compile(
 # carries a technical token (model/provider/stream/retry/api), drop it
 # even if no specific phrase matched. Catches future variants without
 # requiring a regex update each time.
-_STATUS_EMOJI_PREFIX_RE = re.compile(r"^\s*(?:⚠|ℹ️|ℹ|⚠️|⏳|📬|🔄|🔁|❌|⛔|🛑|💥|💾|📝|🧠|🗒️|📋|🔧|⚙️|🔍|🗜️|⟳)")
+_STATUS_EMOJI_PREFIX_RE = re.compile(
+    r"^\s*(?:⚠|ℹ️|ℹ|⚠️|⏳|⏱️|⏱|📬|🔄|🔁|❌|⛔|🛑|💥|💾|📝|🧠|🗒️|📋|🔧|⚙️|🔍|🗜️|🗜|📦|💤|⟳|↻|✓|✔️|✔|☑️|☑)"
+)
 _STATUS_TOKEN_RE = re.compile(
     r"\b(model|provider|stream|streaming|retry|retrying|api|connection|"
     r"timeout|reconnect|backend|chunk|ttfb|abort|fallback)\b",
@@ -199,9 +201,16 @@ def _datamark_user_text(text: str, nonce: str) -> str:
 # (⚠/ℹ/◐/🔄/💾/🗜...). Reply thật của bot (persona) mở đầu bằng chữ, không emoji.
 _LEADING_EMOJI_RE = re.compile(
     r"^\s*(?:"
-    r"⚠|ℹ|◐|◑|◒|◓|◆|◇|⏳|⌛|📬|🔄|🔁|⟳|❌|⛔|🛑|💥|💾|🗜|🧠|🔧|⚙|🔍|📝|🗒|📋"
+    r"⚠|ℹ|◐|◑|◒|◓|◆|◇|⏳|⌛|⏱|📬|🔄|🔁|⟳|↻|❌|⛔|🛑|💥|💾|🗜|🧠|🔧|⚙|🔍|📝|🗒|📋|📦|💤"
     r")️?"
 )
+
+# Hermes lifecycle glyphs that a REAL Vietnamese reply also plausibly opens
+# with ("✔ Đã đặt lịch cho anh", "⚡ Đơn đang giao"). Dropping on the glyph
+# alone would eat legitimate answers, so these only count as a system notice
+# when the text carries no Vietnamese diacritic — i.e. it is raw English
+# runtime output such as "✓ Context compaction complete — continuing turn...".
+_LEADING_EMOJI_EN_ONLY_RE = re.compile(r"^\s*(?:✓|✔|☑|⚡)️?")
 
 
 # Reply thật của bot LUÔN tiếng Việt (ta/con). Đôi khi model lỡ xuất văn bản
@@ -241,6 +250,10 @@ def _scrub_outgoing(text: str) -> Optional[str]:
         return None
     # Rule 3: mở đầu bằng emoji/ký hiệu → thông báo Hermes, drop cho khách.
     if _LEADING_EMOJI_RE.match(t):
+        return None
+    # Rule 3b: glyph dùng chung với câu trả lời thật ("✔ Đã đặt lịch") — chỉ
+    # drop khi KHÔNG có dấu tiếng Việt, tức là text vận hành tiếng Anh.
+    if _LEADING_EMOJI_EN_ONLY_RE.match(t) and not _VN_DIACRITIC_RE.search(t):
         return None
     # Rule 4: model reasoning/planning tiếng Anh lọt ra (không có tiếng Việt +
     # dính >=2 mẫu planning). Reply thật luôn tiếng Việt → an toàn.
@@ -3439,7 +3452,10 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
         # any chat; terminal failures collapse to ONE localized recovery notice
         # per chat/category; a real answer next to a notice is preserved. Owner
         # audit continues via structured logs, not chat spam.
-        _decision = _classify_outbound(content)
+        # Non-owner chats additionally lose the operator-facing notices core
+        # keeps visible on purpose (/compress feedback, compression aborted,
+        # blocked-overflow warning) — see message_filtering._OWNER_ONLY_*.
+        _decision = _classify_outbound(content, is_owner=self._is_owner_dm(chat_id))
         if _decision.action == _FilterAction.DROP_OPERATIONAL:
             logger.info("[zalo-personal] dropped operational msg cats=%s chat_hash=%s",
                         ",".join(_decision.categories), _chat_hash(chat_id))
@@ -4069,7 +4085,7 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
         survives is routed through ``send`` → ``_send_text_impl``, the single
         final text choke point that re-applies the same classifier.
         """
-        decision = _classify_outbound(content)
+        decision = _classify_outbound(content, is_owner=self._is_owner_dm(chat_id))
         if decision.action != _FilterAction.KEEP or not decision.cleaned_text.strip():
             logger.debug("[zalo-personal] suppressed status key=%s chat_hash=%s cats=%s",
                          status_key, _chat_hash(chat_id), ",".join(decision.categories))

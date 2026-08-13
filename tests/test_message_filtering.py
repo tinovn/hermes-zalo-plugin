@@ -35,6 +35,198 @@ class TestClassifyOperational(unittest.TestCase):
         self.assertEqual(d.action, FilterAction.DROP_OPERATIONAL)
 
 
+# Verbatim status wording emitted by NousResearch/hermes-agent — copied from
+# agent/conversation_compression.py (ROUTINE_COMPRESSION_STATUS_SAMPLES,
+# COMPACTION_DONE_STATUS) and tests/gateway/test_telegram_noise_filter.py
+# (NOISY_STATUS_MESSAGES). Every one of these must be invisible on Zalo,
+# including in the owner DM. Re-check this list when bumping hermes-agent.
+HERMES_OPERATIONAL_STATUSES = [
+    # The one that actually leaked into a customer group: upstream keeps the
+    # "compacted" lifecycle edge deliverable on chat surfaces on purpose.
+    "✓ Context compaction complete — continuing turn...",
+    "🗜️ Compacting context — summarizing earlier conversation so I can continue...",
+    "🗜️ Preflight compression check before sending...",
+    "📦 Preflight compression: ~120,000 tokens >= 100,000 threshold. This may take a moment.",
+    (
+        "📦 Pre-API compression: ~123,456 tokens near the context/output limit. "
+        "Compacting before the next model call."
+    ),
+    "💤 Resumed after 3600s idle — compacting ~120,000 tokens before continuing.",
+    "🗜️ Context too large (~250,000 tokens) — compressing (1/3)...",
+    "🗜️ Compressed 30 → 12 messages, retrying...",
+    "🗜️ Compressed ~250,000 → ~120,000 tokens, retrying...",
+    "🗜️ Context reduced to 120,000 tokens (was 250,000), retrying...",
+    "⚠️  Session compressed 12 times — accuracy may degrade. Consider /new to start fresh.",
+    "⚠ Compression summary failed: upstream error. Inserted a fallback context marker.",
+    "⚠ Auxiliary title generation failed: HTTP 400: Operation contains cybersecurity risk",
+    (
+        "ℹ Configured compression model 'small-model' failed (timeout). Recovered "
+        "using main model — check auxiliary.compression.model in config.yaml."
+    ),
+    (
+        "⚠ Compression model small (openrouter) context is 32,000 tokens, but the "
+        "main model big (anthropic)'s compression threshold was 100,000 tokens. "
+        "Auto-lowered this session's threshold to 30,000 tokens so compression can run."
+    ),
+    (
+        "⚠ Configured auxiliary compression provider 'openai' is unavailable — "
+        "context compression will drop middle turns without a summary. Check "
+        "auxiliary.compression in config.yaml and reauthenticate that provider."
+    ),
+    (
+        "⚠ Skipping concurrent compression — another path is already compressing "
+        "this session. Will retry after it finishes."
+    ),
+    "⏱️ Rate limited. Waiting 30.0s (attempt 2/3)...",
+    "⏳ Retrying in 4.2s (attempt 1/3)...",
+    "⚠️ Max retries (3) exhausted — trying fallback...",
+    "ℹ gpt-5.5 caps context at 272K, so auto-compaction was raised to 85%.",
+    # Turn-recovery mechanics (agent/conversation_loop.py).
+    "↻ Empty response after tool calls — using earlier content as final answer",
+    "↻ Model signaled a tool call but sent none — retrying",
+    "↻ Stream interrupted — using delivered content",
+    "↻ Thinking-only response — prefilling to continue",
+    "↻ Switched to fallback: big-model (anthropic)",
+    "🔄 Primary model failed — switching to fallback: big-model",
+    "🔄 Retrying API call (2/3)...",
+    "⚠️  API call failed (attempt 2/3): TimeoutError",
+    "⚠️  Invalid API response (attempt 1/3): missing content",
+    "⚠️  Invalid JSON in tool call arguments for 'web_search': unexpected token",
+    "⚠️  Unknown tool 'foo_bar' — sending error to model for agent-correction (1/3)",
+    "⚠️  Reached maximum iterations (40). Requesting summary...",
+    "⚠️  Request payload too large (413) — compression attempt 1/3...",
+    "⚠️  Stripped invalid surrogate characters from messages. Retrying...",
+    "⚠️  Truncated tool call detected — retrying",
+    "⚠️  Incomplete <REASONING_SCRATCHPAD> detected (opened but never closed)",
+    "⏱️ Agent inactive for 10 min — no tool calls",
+    "⚠️  Context length exceeded — using provider limit: 200,000 → 272,000 tokens",
+    (
+        "⚠️  Context length exceeded, but provider did not report a max context "
+        "length; falling back to the configured limit."
+    ),
+]
+
+# Operator-facing beyond compression: gateway back-pressure and host admin.
+HERMES_OWNER_ONLY_EXTRA = [
+    "⏳ Working — 3 min",
+    "⏳ Queued for the next turn. Your message will be picked up shortly.",
+    "⏳ Another turn is still running on this session. To interrupt, send /stop.",
+    "⏳ Gateway is compacting and is not accepting another turn right now.",
+    "⏳ Subagent working — your message is queued for the next turn.",
+    "⚠️ **Command Approval Required**",
+    "⚠ ⚠ Credits 90% used",
+    "❌ Hermes update failed (exit code 1).",
+    "⚠️  Some tools may not work due to missing requirements: playwright",
+    "⚠️  Warning: API key appears invalid or missing",
+    "⚠ Lightpanda fallback: Chrome was used for this browser action.",
+    "🛑 [board] Kanban task-42 routed to TRIAGE",
+]
+
+# Provider/terminal failures: the owner sees the technical line, the customer
+# gets one localized recovery notice instead.
+HERMES_PROVIDER_FAILURES = [
+    "❌ API failed after 3 retries — timeout",
+    "❌ Billing or credits exhausted — top up to continue",
+    "❌ Rate limited after 3 retries — provider 429",
+    "❌ Connection to provider failed after 3 attempts",
+    "❌ Provider returned an empty response stream after 3 retries",
+    "❌ Non-retryable error (HTTP 401): unauthorized",
+    "❌ Model returned no content after all retries",
+    "❌ TLS certificate verification failed: self-signed cert",
+    "⚠ no response from provider in 120s — aborting",
+    "⏱️ The model provider is rate-limiting requests. Please wait a moment and try again.",
+    "⚠️  The model declined to respond to this request",
+]
+
+# hermes-agent keeps these visible on chat surfaces on purpose (the operator
+# must act on them). The owner DM still gets them; a customer never does.
+HERMES_OWNER_ONLY_STATUSES = [
+    "Compressed: 30 → 12 messages",
+    "Compressed with fallback: 30 → 12 messages",
+    "No changes from compression: 30 messages",
+    "Compression aborted: 30 messages preserved",
+    (
+        "⚠ Compression returned an empty transcript. No session split was "
+        "performed; conversation continues unchanged."
+    ),
+    (
+        "⏳ Compression already in progress for this session "
+        "(holder: pid=12345:tid=7:agent=1:nonce=ab). Please wait for it to finish."
+    ),
+    (
+        "⏳ Compression skipped: could not acquire this session's compression "
+        "lock. Another compression may still be running, or the lock check "
+        "failed — try again shortly."
+    ),
+]
+
+
+class TestHermesStatusInventory(unittest.TestCase):
+    """Pinned upstream wording — nothing here may reach a Zalo chat."""
+
+    def test_all_operational_statuses_dropped_for_everyone(self):
+        for t in HERMES_OPERATIONAL_STATUSES:
+            for is_owner in (False, True):
+                d = classify(t, is_owner=is_owner)
+                self.assertEqual(
+                    d.action, FilterAction.DROP_OPERATIONAL, f"{t!r} owner={is_owner}"
+                )
+                self.assertEqual(d.cleaned_text, "")
+
+    def test_owner_only_statuses_hidden_from_non_owner(self):
+        for t in HERMES_OWNER_ONLY_STATUSES + HERMES_OWNER_ONLY_EXTRA:
+            d = classify(t, is_owner=False)
+            self.assertEqual(d.action, FilterAction.DROP_OPERATIONAL, t)
+            self.assertEqual(d.cleaned_text, "")
+
+    def test_owner_only_statuses_reach_owner_dm(self):
+        for t in HERMES_OWNER_ONLY_STATUSES + HERMES_OWNER_ONLY_EXTRA:
+            d = classify(t, is_owner=True)
+            self.assertEqual(d.action, FilterAction.KEEP, t)
+            self.assertEqual(d.cleaned_text, t)
+
+    def test_provider_failures_become_recovery_notice_for_customer(self):
+        for t in HERMES_PROVIDER_FAILURES:
+            d = classify(t, is_owner=False)
+            self.assertEqual(d.action, FilterAction.REPLACE_TERMINAL, t)
+            self.assertEqual(d.cleaned_text, RECOVERY_NOTICE)
+            self.assertIsNotNone(d.recovery_key)
+
+    def test_provider_failures_stay_raw_for_owner(self):
+        for t in HERMES_PROVIDER_FAILURES:
+            d = classify(t, is_owner=True)
+            self.assertEqual(d.action, FilterAction.KEEP, t)
+            self.assertEqual(d.cleaned_text, t)
+
+    def test_blocked_overflow_warning_becomes_recovery_for_customer(self):
+        t = (
+            "⚠ Context is over the compression threshold (~85,000 tokens >= "
+            "72,000) but compression is currently blocked (cooldown:30). The "
+            "model may stop responding. Run /new to start a fresh session or "
+            "/compress to retry immediately."
+        )
+        d = classify(t, is_owner=False)
+        self.assertEqual(d.action, FilterAction.REPLACE_TERMINAL)
+        self.assertEqual(d.cleaned_text, RECOVERY_NOTICE)
+        self.assertEqual(classify(t, is_owner=True).action, FilterAction.KEEP)
+
+    def test_real_answer_next_to_leaked_status_survives(self):
+        t = "✓ Context compaction complete — continuing turn...\nDạ combo 2 người là 350k ạ."
+        d = classify(t)
+        self.assertEqual(d.action, FilterAction.KEEP)
+        self.assertEqual(d.cleaned_text, "Dạ combo 2 người là 350k ạ.")
+
+    def test_dropping_is_idempotent(self):
+        for t in (
+            HERMES_OPERATIONAL_STATUSES
+            + HERMES_OWNER_ONLY_STATUSES
+            + HERMES_OWNER_ONLY_EXTRA
+            + HERMES_PROVIDER_FAILURES
+        ):
+            first = classify(t).cleaned_text
+            self.assertEqual(classify(first).cleaned_text, first, t)
+
+
 class TestClassifyTerminal(unittest.TestCase):
     def test_context_exceeded_replaced(self):
         d = classify("Context length exceeded: 149,611 tokens. Cannot compress further.")

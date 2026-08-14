@@ -4373,6 +4373,12 @@ _NON_OWNER_ALLOWED_TOOLS: set = {
     # "skills_list" là biến thể số nhiều của cùng một tool liệt kê skill —
     # Hermes/MCP đặt tên không thống nhất, mở cả hai cho chắc.
     "skill_view", "skill_list", "skills_list",
+    # Tool catalog READ-ONLY — cùng nhóm với skill_view/skill_list: chỉ TRA
+    # danh mục tool (tìm + xem mô tả/schema), KHÔNG gọi tool nào. Việc chạy
+    # tool tìm được vẫn phải qua đúng cổng này, nên tra cứu không tự nó nới
+    # quyền. Đánh đổi owner đã chấp nhận: khách thấy được tên/mô tả các tool
+    # nội bộ (kể cả tool owner-only) — chỉ metadata, không có dữ liệu.
+    "tool_search", "tool_describe",
 }
 
 # Rate limit cho các tool gửi file (chống spam).
@@ -4776,7 +4782,10 @@ def _zalo_pre_tool_call_hook(
     # OTP riêng (tool auth=True cần conv_token/session) — cổng plugin mở không
     # bỏ qua lớp OTP đó. shell/filesystem/git/zalo_api_call (không phải tool
     # tino) VẪN khoá cho khách.
-    if tname.startswith("mcp_tino_") or base_name.startswith("mcp_tino_"):
+    # Chấp nhận cả hai kiểu đặt tên: "mcp_tino_<tool>" (Hermes rút gọn) và
+    # "mcp__tino__<tool>" (chuẩn MCP mcp__<server>__<tool>) — cùng một MCP.
+    _TINO_MCP_PREFIXES = ("mcp_tino_", "mcp__tino__")
+    if tname.startswith(_TINO_MCP_PREFIXES) or base_name.startswith(_TINO_MCP_PREFIXES):
         return None
 
     if base_name in _NON_OWNER_ALLOWED_TOOLS:

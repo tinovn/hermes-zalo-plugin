@@ -4370,7 +4370,9 @@ _NON_OWNER_ALLOWED_TOOLS: set = {
     # nội dung skill), KHÔNG chạy skill, không đụng file/shell/config.
     # Đánh đổi owner đã chấp nhận: lộ danh sách + hướng dẫn skill nội bộ cho
     # người ngoài. Mọi tool skill_* GHI (tạo/sửa/xoá) vẫn default-deny.
-    "skill_view", "skill_list",
+    # "skills_list" là biến thể số nhiều của cùng một tool liệt kê skill —
+    # Hermes/MCP đặt tên không thống nhất, mở cả hai cho chắc.
+    "skill_view", "skill_list", "skills_list",
 }
 
 # Rate limit cho các tool gửi file (chống spam).

@@ -4372,7 +4372,7 @@ _NON_OWNER_ALLOWED_TOOLS: set = {
     # người ngoài. Mọi tool skill_* GHI (tạo/sửa/xoá) vẫn default-deny.
     # "skills_list" là biến thể số nhiều của cùng một tool liệt kê skill —
     # Hermes/MCP đặt tên không thống nhất, mở cả hai cho chắc.
-    "skill_view", "skill_list", "skills_list",
+    "skill_view", "skill_list", "skills_list", "skill_get", "skill_search",
     # Tool catalog READ-ONLY — cùng nhóm với skill_view/skill_list: chỉ TRA
     # danh mục tool (tìm + xem mô tả/schema), KHÔNG gọi tool nào. Việc chạy
     # tool tìm được vẫn phải qua đúng cổng này, nên tra cứu không tự nó nới

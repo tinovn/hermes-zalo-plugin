@@ -4559,10 +4559,11 @@ def _maybe_install_file_packages() -> Dict[str, bool]:
     if not needed:
         return status
     import subprocess
+    import sys
     try:
         logger.info(f"[zalo-personal] auto-installing file-gen libs: {needed}")
         res = subprocess.run(
-            ["uv", "pip", "install", "--python", "/opt/hermes/.venv/bin/python3"] + needed,
+            ["uv", "pip", "install", "--python", sys.executable] + needed,
             check=True,
             timeout=240,
             capture_output=True,

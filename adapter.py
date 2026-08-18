@@ -3377,7 +3377,6 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
     # occasionally fails the send entirely. We keep each outgoing chunk
     # under this threshold; longer responses are split.
     SEND_CHUNK_LIMIT = 1900
-    SEND_CHUNK_HARD_LIMIT = 4500  # split if response exceeds this
 
     async def send(
         self,
@@ -3508,7 +3507,7 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
         # If the message is too long, split into chunks and send sequentially.
         # Only the FIRST chunk attaches the quote (reply_to); subsequent
         # chunks are plain follow-ups so the conversation stays clean.
-        if len(content) > self.SEND_CHUNK_HARD_LIMIT:
+        if len(content) > self.SEND_CHUNK_LIMIT:
             chunks = self._split_long_message(content, self.SEND_CHUNK_LIMIT)
             first_result: Optional[SendResult] = None
             for idx, chunk in enumerate(chunks):

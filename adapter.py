@@ -340,6 +340,13 @@ def _zalo_plaintext(text: str) -> str:
     return t.strip()
 
 
+# eKYC đã chuyển sang Zalo mini-app (2026-07). Ép MỌI link eKYC cũ
+# (tino.vn/ekyc/) sang zalo.me — kể cả khi tool MCP trả ekyc_url cũ hoặc
+# phiên còn nạp bản skill cũ. Áp cho mọi chat (owner + khách).
+_EKYC_OLD_RE = re.compile(r"https?://(?:www\.)?tino\.vn/ekyc/", re.IGNORECASE)
+_EKYC_NEW_BASE = "https://zalo.me/s/1106381038231966057/"
+
+
 def _strip_cron_envelope(text: str) -> str:
     """Remove the Hermes cron/reminder delivery envelope, keep only the body."""
     if not text or ("Response" not in text and "job_id" not in text):
@@ -3437,6 +3444,7 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
         # filters below deliberately skip.
         content = _strip_cron_envelope(content)
         content = _zalo_plaintext(content)
+        content = _EKYC_OLD_RE.sub(_EKYC_NEW_BASE, content)
         if not content.strip():
             return SendResult(success=False, error="empty content")
 

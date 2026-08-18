@@ -1867,12 +1867,17 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
         #           /bot status
         #           /bot help
         # Only the owner can use these.
+        # Strip a leading @BotName first: in a group the owner has to mention
+        # the bot for it to react at all under the default mention_only mode,
+        # so the natural way to issue a command is "@Bot /bot status" — which
+        # does not start with "/bot" and used to fall through to the agent.
+        _cmd_text = self._strip_self_mention(text, content) if isinstance(text, str) else text
         if (
             from_uid == self.owner_uid
-            and isinstance(text, str)
-            and text.strip().lower().startswith("/bot")
+            and isinstance(_cmd_text, str)
+            and _cmd_text.strip().lower().startswith("/bot")
         ):
-            reply = self._handle_owner_command(text.strip(), thread_id, is_group)
+            reply = self._handle_owner_command(_cmd_text.strip(), thread_id, is_group)
             if reply is not None:
                 await self.send(thread_id, reply)
                 return

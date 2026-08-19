@@ -15,6 +15,7 @@ Configuration via env vars:
 
 import asyncio
 import datetime
+import functools
 import json
 import logging
 import os
@@ -9376,8 +9377,56 @@ def _zalo_campaign_sync_handler(args: Any = None, **kwargs) -> Dict[str, Any]:
             "message": f"Đã đồng bộ {len(leads)} lead lên Sheet: {camp.get('sheet_id')}"}
 
 
+def _tool_result_as_text(result: Any) -> Any:
+    """Coerce a handler result into the string the tool pipeline expects.
+
+    Hermes >= 0.20 rejects anything but a string (or the multimodal envelope)
+    with "Tool handler returned unsupported result type: dict", and every
+    handler in this plugin is annotated ``-> Dict[str, Any]``. On 2026-08-18/19
+    that broke 51 of 52 tools on a 0.20.4 host — 102 logged failures covering
+    zalo_get_chat_mode, zalo_set_chat_persona, zalo_send_image, zalo_send_pdf,
+    zalo_groups_list and more — while the same plugin kept working on a 0.18.0
+    host, which coerces with ``str()`` instead.
+
+    Serialising here rather than editing 51 handlers keeps the change in one
+    place and covers tools added later. It also improves the older hosts: they
+    used to receive a Python repr (``{'success': True}``) where the model now
+    gets real JSON.
+
+    ``default=str`` so a stray non-serialisable value degrades to its repr
+    instead of raising and losing the whole tool result.
+    """
+    if isinstance(result, str):
+        return result
+    if (
+        isinstance(result, dict)
+        and result.get("_multimodal") is True
+        and isinstance(result.get("content"), list)
+    ):
+        return result  # multimodal envelope — the pipeline consumes it as-is
+    return json.dumps(result, ensure_ascii=False, default=str)
+
+
+def _stringify_tool_handler(handler):
+    """Wrap a tool handler so its result always satisfies the pipeline."""
+    @functools.wraps(handler)
+    def _wrapped(*args, **kwargs):
+        return _tool_result_as_text(handler(*args, **kwargs))
+    return _wrapped
+
+
 def register(ctx):
     """Plugin entry point."""
+    # Every ctx.register_tool below hands back a dict; wrap once here so
+    # the pipeline always receives a string (see _tool_result_as_text).
+    _orig_register_tool = ctx.register_tool
+
+    def _register_tool(*a, **kw):
+        if callable(kw.get("handler")):
+            kw["handler"] = _stringify_tool_handler(kw["handler"])
+        return _orig_register_tool(*a, **kw)
+
+    ctx.register_tool = _register_tool
     kwargs = dict(
         name="zalo-personal",
         label="Zalo (cá nhân)",

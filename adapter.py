@@ -227,6 +227,89 @@ _MODEL_PLANNING_RE = re.compile(
 )
 
 
+# ── Mode bảo trì (owner bật/tắt, tạm dừng toàn bộ agent + tự báo khách) ──
+# State nằm ở <session_dir>/maintenance.json để sống sót qua restart và để
+# tiến trình khác (cron/worker) đọc được cùng một cờ.
+_MAINT_FILENAME = "maintenance.json"
+# Câu mặc định cố ý KHÔNG gắn tên/nhân xưng riêng của bot — persona có thể
+# ghi đè qua bot_persona.json → notices.maintenance, hoặc owner đặt câu riêng
+# bằng `/bot baotri <câu>`.
+_MAINT_DEFAULT_MSG = (
+    "Hệ thống đang được nâng cấp thêm tính năng mới nên tạm nghỉ một chút ạ. "
+    "Sẽ quay lại sớm nhất — mọi người chờ chút rồi nhắn lại giúp nhé, "
+    "xin lỗi vì sự bất tiện 🙏"
+)
+_MAINT_NOTICE_INTERVAL_S = 900  # tối đa 1 thông báo / chat / 15 phút
+
+
+def _maint_file() -> Path:
+    return Path(
+        os.getenv("ZALO_PERSONAL_SESSION_DIR") or "/opt/data/zalo"
+    ) / _MAINT_FILENAME
+
+
+def _get_maintenance() -> Dict[str, Any]:
+    """Đọc cờ bảo trì. Lỗi đọc/parse → coi như TẮT (fail-open, bot vẫn chạy)."""
+    try:
+        f = _maint_file()
+        if f.exists():
+            d = json.loads(f.read_text(encoding="utf-8"))
+            if isinstance(d, dict):
+                return d
+    except Exception as e:
+        logger.warning(f"[zalo-personal] _get_maintenance failed: {e}")
+    return {"enabled": False, "message": ""}
+
+
+def _set_maintenance(enabled: bool, message: str = "") -> bool:
+    try:
+        f = _maint_file()
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(
+            json.dumps(
+                {
+                    "enabled": bool(enabled),
+                    "message": message or "",
+                    "set_at": datetime.datetime.now().isoformat(timespec="seconds"),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        return True
+    except Exception as e:
+        logger.warning(f"[zalo-personal] _set_maintenance failed: {e}")
+        return False
+
+
+def _maintenance_message() -> str:
+    """Câu gửi khách khi đang bảo trì: owner đặt riêng > persona notice > default."""
+    custom = (_get_maintenance().get("message") or "").strip()
+    if custom:
+        return custom
+    return _persona_notice("maintenance", _MAINT_DEFAULT_MSG)
+
+
+def _maint_message_deliverable(msg: str) -> bool:
+    """True nếu câu bảo trì sống sót qua bộ lọc outbound cho khách thường.
+
+    Câu bảo trì đi thẳng ra khách (không qua LLM); nếu nó mở đầu bằng emoji
+    trạng thái hoặc dính mẫu "thông báo hệ thống" thì send() sẽ drop và khách
+    không nhận được gì. Kiểm tra trước để owner biết mà sửa câu.
+    """
+    try:
+        decision = _classify_outbound(msg, is_owner=False)
+        if decision.action != _FilterAction.KEEP:
+            return False
+        cleaned = _strip_non_owner_internal_noise(decision.cleaned_text)
+        if not cleaned.strip():
+            return False
+        return _scrub_outgoing(cleaned) is not None
+    except Exception:
+        return True
+
+
 def _scrub_outgoing(text: str) -> Optional[str]:
     """Return cleaned text safe for end-user delivery, or None to drop.
 
@@ -867,6 +950,9 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
         # Bounded ring buffer to avoid unbounded growth.
         self._sent_msg_ids: List[str] = []
         self._sent_msg_ids_max = 500
+
+        # Mode bảo trì: chat_id -> epoch lần cuối gửi thông báo (RL 15').
+        self._maint_notified: Dict[str, float] = {}
 
         # Map ``message_id`` (string we expose to Hermes) → full quote
         # payload (zca-js SendMessageQuote shape) for the most recent
@@ -1948,6 +2034,29 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
                 return
             if is_mentioned:
                 text = self._strip_self_mention(text, content)
+
+        # ── Mode bảo trì: khách nhắn → tự trả thông báo, KHÔNG đẩy qua agent.
+        # Owner được bypass để còn tắt được mode. Đặt SAU trigger-gate nên
+        # tin trong nhóm không tag bot vẫn im lặng như thường; mỗi chat tối
+        # đa 1 thông báo / _MAINT_NOTICE_INTERVAL_S giây.
+        if from_uid != self.owner_uid and _get_maintenance().get("enabled"):
+            now = time.time()
+            if now - self._maint_notified.get(thread_id, 0.0) > _MAINT_NOTICE_INTERVAL_S:
+                if len(self._maint_notified) > 500:  # bounded: dọn chat đã hết RL
+                    self._maint_notified = {
+                        k: v for k, v in self._maint_notified.items()
+                        if now - v <= _MAINT_NOTICE_INTERVAL_S
+                    }
+                self._maint_notified[thread_id] = now
+                try:
+                    await self.send(thread_id, _maintenance_message())
+                except Exception as e:
+                    logger.warning(f"[zalo-personal] maintenance notice failed: {e}")
+            logger.info(
+                f"[zalo-personal] maintenance mode — auto-notice, skip agent "
+                f"from={from_uid} chat={thread_id}"
+            )
+            return
 
         # ── Defense-in-depth against prompt injection ──────────────────
         # For every non-owner message, apply datamarking spotlight: wrap
@@ -3950,6 +4059,47 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
                 "• default      — dùng config global"
             )
 
+        if verb in ("baotri", "bao-tri", "bao_tri", "maintenance", "maint"):
+            a = arg.strip()
+            low = a.lower()
+            if low in ("off", "tắt", "tat", "stop", "0", "false"):
+                if not _set_maintenance(False):
+                    return "⚠️ Không ghi được file trạng thái bảo trì — kiểm tra quyền ghi session dir."
+                self._maint_notified.clear()
+                return "✅ Đã TẮT mode bảo trì. Bot hoạt động lại bình thường."
+            if not a:
+                cur = _get_maintenance()
+                if cur.get("enabled"):
+                    return (
+                        "🔧 Mode bảo trì: ĐANG BẬT.\n"
+                        f"Câu gửi khách: {_maintenance_message()}\n\n"
+                        "Tắt: /bot baotri off"
+                    )
+                return (
+                    "🔧 Mode bảo trì: ĐANG TẮT.\n"
+                    "Bật kèm giờ: /bot baotri Bọn em bảo trì tới 15h30 hôm nay ạ\n"
+                    "Bật mặc định: /bot baotri on"
+                )
+            if low in ("on", "bật", "bat", "1", "true"):
+                if not _set_maintenance(True, ""):
+                    return "⚠️ Không ghi được file trạng thái bảo trì — kiểm tra quyền ghi session dir."
+                self._maint_notified.clear()
+                return (
+                    "✅ Đã BẬT mode bảo trì (câu mặc định).\n"
+                    f"Câu gửi khách: {_maintenance_message()}\n\nTắt: /bot baotri off"
+                )
+            if not _maint_message_deliverable(a):
+                return (
+                    "⚠️ Câu này sẽ bị bộ lọc chặn nên khách KHÔNG nhận được "
+                    "(thường do mở đầu bằng emoji trạng thái ⚠️/🔧/⏳ hoặc nghe "
+                    "giống thông báo hệ thống). Anh viết lại bằng câu thường, "
+                    "mở đầu bằng chữ giúp em nhé. Mode bảo trì CHƯA được bật."
+                )
+            if not _set_maintenance(True, a):
+                return "⚠️ Không ghi được file trạng thái bảo trì — kiểm tra quyền ghi session dir."
+            self._maint_notified.clear()
+            return f"✅ Đã BẬT mode bảo trì.\nCâu gửi khách:\n{a}\n\nTắt: /bot baotri off"
+
         return f"Lệnh '{verb}' không hiểu. Gõ /bot help để xem cú pháp."
 
     def _owner_command_help(self) -> str:
@@ -3959,6 +4109,9 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
             "/bot mode <type>         — đổi mode (active/mention_only/listen_only/mute/default)\n"
             "/bot modes               — liệt kê các mode\n"
             "/bot digest <on|off>     — bật/tắt daily digest cho chat này\n"
+            "/bot baotri              — xem trạng thái bảo trì\n"
+            "/bot baotri <câu+giờ>    — BẬT bảo trì (khách nhận thông báo tự động)\n"
+            "/bot baotri off          — TẮT bảo trì\n"
             "/bot help                — hiện trợ giúp\n\n"
             "Ví dụ:\n"
             "/bot mode active         — em phản hồi mọi tin trong chat này\n"

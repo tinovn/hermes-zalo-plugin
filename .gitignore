@@ -32,3 +32,6 @@ venv/
 .idea/
 .vscode/
 *.log
+/plans/
+/.serena/
+/docs/

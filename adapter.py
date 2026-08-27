@@ -310,6 +310,21 @@ def _maint_message_deliverable(msg: str) -> bool:
         return True
 
 
+# ── Cuộc gọi nhỡ: tự nhắn lại ────────────────────────────────────────────
+# Zalo đẩy log cuộc gọi dưới dạng msgType "chat.recommended" + content.action
+# chứa "call" (…call.miss = gọi nhỡ). Sidecar bóc thành kind="call".
+# Câu mặc định KHÔNG hứa gọi lại — bot chỉ nhắn tin được, hứa gọi lại là nói
+# dối khách. Persona ghi đè qua bot_persona.json → notices.missed_call.
+_MISSED_CALL_DEFAULT_MSG = (
+    "Xin lỗi, kênh Zalo này chỉ nhắn tin nên chưa nghe gọi được ạ. "
+    "Anh/chị nhắn nội dung cần hỗ trợ ở đây giúp nhé, sẽ phản hồi ngay ạ."
+)
+
+
+def _missed_call_message() -> str:
+    return _persona_notice("missed_call", _MISSED_CALL_DEFAULT_MSG)
+
+
 def _scrub_outgoing(text: str) -> Optional[str]:
     """Return cleaned text safe for end-user delivery, or None to drop.
 
@@ -953,6 +968,8 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
 
         # Mode bảo trì: chat_id -> epoch lần cuối gửi thông báo (RL 15').
         self._maint_notified: Dict[str, float] = {}
+        # Cuộc gọi nhỡ: chat_id -> epoch lần cuối tự nhắn lại.
+        self._missed_call_notified: Dict[str, float] = {}
 
         # Map ``message_id`` (string we expose to Hermes) → full quote
         # payload (zca-js SendMessageQuote shape) for the most recent
@@ -1012,6 +1029,23 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
         self._auto_friend_msg = os.getenv(
             "ZALO_PERSONAL_AUTO_FRIEND_MSG", "Mình kết bạn để tiện hỗ trợ nhé!"
         ).strip()
+        # Cuộc gọi nhỡ → tự nhắn lại (bot không nghe/gọi được).
+        self._missed_call_reply = (
+            os.getenv("ZALO_PERSONAL_MISSED_CALL_REPLY", "true").strip().lower()
+            in ("1", "true", "yes", "on")
+        )
+        # Mặc định CHỈ DM: cuộc gọi nhóm ai cũng bấm được, trả lời trong nhóm
+        # dễ thành spam.
+        self._missed_call_in_groups = (
+            os.getenv("ZALO_PERSONAL_MISSED_CALL_IN_GROUPS", "false").strip().lower()
+            in ("1", "true", "yes", "on")
+        )
+        try:
+            self._missed_call_interval_s = float(
+                os.getenv("ZALO_PERSONAL_MISSED_CALL_INTERVAL_S", "600")
+            )
+        except ValueError:
+            self._missed_call_interval_s = 600.0
         # Cache danh bạ (uid) để không gọi /friends/all mỗi tin nhắn.
         self._friend_uids: set = set()
         self._friend_uids_ts: float = 0.0
@@ -1858,6 +1892,13 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
                 message_type = MessageType.VOICE
             else:
                 text = "[voice không tải được]"
+        elif kind == "call":
+            # Log cuộc gọi — không có nội dung cho agent. Xử lý tại chỗ rồi
+            # dừng: đẩy tiếp chỉ tổ khiến bot trả lời một tin rỗng.
+            await self._handle_call_event(
+                content, thread_id, from_uid, is_group, chat_mode
+            )
+            return
         elif kind == "file":
             fname = content.get("filename") or "file"
             size = content.get("bytes") or content.get("size") or 0
@@ -3987,6 +4028,65 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
             "• Nếu chưa rõ ý sếp, hỏi lại 1 câu ngắn trước khi gọi tool.\n"
             "═════════════════════════════════════════════"
         )
+
+    async def _handle_call_event(
+        self,
+        content: Dict[str, Any],
+        thread_id: str,
+        from_uid: str,
+        is_group: bool,
+        chat_mode: str = "default",
+    ) -> None:
+        """Cuộc gọi tới bot → tự nhắn lại một câu (bot không nghe gọi được).
+
+        Chỉ trả lời cuộc gọi NHỠ (``action`` chứa "miss"); cuộc gọi đã kết nối
+        chỉ ghi log. Rate-limit theo chat vì khách hay bấm gọi liên tiếp mấy
+        lần. Log in ra ``action`` thô của MỌI cuộc gọi để còn chỉnh bộ nhận
+        diện nếu Zalo đổi chuỗi.
+        """
+        action = str(content.get("action") or "")
+        missed = bool(content.get("missed"))
+        logger.info(
+            "[zalo-personal] call event action=%s missed=%s video=%s "
+            "chat=%s from=%s",
+            action, missed, bool(content.get("video")), thread_id, from_uid,
+        )
+        if not missed or not self._missed_call_reply:
+            return
+        if chat_mode in ("listen_only", "mute"):
+            return
+        if is_group and not self._missed_call_in_groups:
+            return
+
+        now = time.time()
+        # Bảo trì thắng: khách gọi lúc bot đang tạm nghỉ thì cần biết là bảo
+        # trì, không phải "nhắn tin đi sẽ trả lời ngay".
+        if from_uid != self.owner_uid and _get_maintenance().get("enabled"):
+            if now - self._maint_notified.get(thread_id, 0.0) <= _MAINT_NOTICE_INTERVAL_S:
+                return
+            self._maint_notified[thread_id] = now
+            msg = _maintenance_message()
+        else:
+            if (
+                now - self._missed_call_notified.get(thread_id, 0.0)
+                <= self._missed_call_interval_s
+            ):
+                logger.debug(
+                    f"[zalo-personal] missed-call reply suppressed (RL) chat={thread_id}"
+                )
+                return
+            if len(self._missed_call_notified) > 500:  # bounded: dọn chat hết RL
+                self._missed_call_notified = {
+                    k: v for k, v in self._missed_call_notified.items()
+                    if now - v <= self._missed_call_interval_s
+                }
+            self._missed_call_notified[thread_id] = now
+            msg = _missed_call_message()
+
+        try:
+            await self.send(thread_id, msg)
+        except Exception as e:
+            logger.warning(f"[zalo-personal] missed-call reply failed: {e}")
 
     def _handle_owner_command(self, text: str, chat_id: str, is_group: bool) -> Optional[str]:
         """Parse `/bot ...` directives sent by the owner.

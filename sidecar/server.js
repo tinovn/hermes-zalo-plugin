@@ -473,6 +473,22 @@ function scheduleWsReconnect() {
 function parseContent(c) {
   if (typeof c === "string") return { kind: "text", text: c };
   if (!c || typeof c !== "object") return { kind: "unknown" };
+  // Log cuộc gọi (thoại/video): Zalo đẩy dưới dạng msgType "chat.recommended"
+  // với content.action chứa "call" (…call.miss = gọi nhỡ/huỷ). Phải bắt TRƯỚC
+  // nhánh title+href bên dưới — nhánh đó coi nó là link preview và nuốt mất
+  // field `action`, adapter hết đường phân biệt. `kind: "call"` cũng giúp tin
+  // này không bị bộ lọc synthetic của adapter drop (nó chỉ drop text/unknown).
+  if (c.action && /call/i.test(String(c.action))) {
+    const act = String(c.action);
+    return {
+      kind: "call",
+      action: act,
+      missed: /miss/i.test(act),
+      video: /video/i.test(act),
+      title: c.title ? String(c.title) : "",
+      description: c.description ? String(c.description) : "",
+    };
+  }
   if (c.thumbUrl || c.normalUrl || c.hdUrl) {
     return {
       kind: "image",

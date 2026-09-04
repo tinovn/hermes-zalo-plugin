@@ -3,7 +3,8 @@
 Replaces the ``zalo_recent_image_base64 -> model -> landing_upload_image`` flow
 (which injected up to ~8MB of base64 into the LLM context and repeatedly blew the
 token budget) with a direct, chat-scoped upload that the model never sees the
-bytes of. The model only receives durable ``image_url`` metadata.
+bytes of. The model only receives durable ``image_url`` metadata (plus
+``image_ref`` = ``asset://<id>`` when the landing engine is TinoPage/webbuild).
 
 Security contract (see plan Phase 3):
   * The model supplies only ``slug`` (+ optional ``filename``/``count``). It can
@@ -206,13 +207,17 @@ class LandingMediaBridge:
                 raise BridgeError("image too large")
             digest = hashlib.sha256(data).hexdigest()
             remote_name = content_addressed_name(filename, digest, ext)
-            image_url = self._upload_one(conv_id, slug, data, mime, remote_name)
+            uploaded = self._upload_one(conv_id, slug, data, mime, remote_name)
             entry: Dict[str, Any] = {
-                "image_url": image_url,
+                "image_url": uploaded["image_url"],
                 "filename": remote_name,
                 "mime": mime,
                 "size": len(data),
             }
+            if uploaded.get("image_ref"):
+                # TinoPage (engine webbuild): the block prop wants ``asset://<id>``,
+                # not the public URL — surface it so the agent can build the op.
+                entry["image_ref"] = uploaded["image_ref"]
             if rr.width and rr.height:
                 entry["width"] = rr.width
                 entry["height"] = rr.height
@@ -220,7 +225,9 @@ class LandingMediaBridge:
         # Compact result; never returns sender, local path, chat id or base64.
         return {"slug": slug, "count": len(images), "images": images}
 
-    def _upload_one(self, conv_id: str, slug: str, data: bytes, mime: str, remote_name: str) -> str:
+    def _upload_one(self, conv_id: str, slug: str, data: bytes, mime: str,
+                    remote_name: str) -> Dict[str, str]:
+        """POST one image; returns ``{"image_url", "image_ref"?}`` (never bytes)."""
         import base64 as _b64
         headers = {
             "X-Agent-Key": self._cfg.key,
@@ -236,16 +243,20 @@ class LandingMediaBridge:
         }
         resp = self._post(self._cfg.url, headers, body) or {}
         image_url = _extract_image_url(resp)
-        if not image_url:
+        image_ref = _extract_image_ref(resp)
+        if not image_url and not image_ref:
             # Surface the MCP's own error so the agent can self-correct (e.g. a
             # wrong slug returns not_found — hiding it behind a generic message
             # left the agent guessing). Never include the key or the payload.
             err = _extract_error_message(resp)
             raise BridgeError(f"upload rejected: {err}" if err
                               else "upload failed: no image_url in response")
-        if not _is_durable_asset_url(image_url):
+        if not _is_durable_upload(image_url, image_ref):
             raise BridgeError("upload returned a non-durable URL")
-        return image_url
+        out = {"image_url": image_url}
+        if image_ref:
+            out["image_ref"] = image_ref
+        return out
 
 
 def _extract_error_message(resp: Dict[str, Any]) -> str:
@@ -273,12 +284,36 @@ def _extract_image_url(resp: Dict[str, Any]) -> str:
     return ""
 
 
+def _extract_image_ref(resp: Dict[str, Any]) -> str:
+    """TinoPage (engine webbuild) answers ``image_ref: asset://<id>`` — the value
+    the agent must put into a block prop via ``landing_update`` ops."""
+    for holder in (resp, resp.get("result") if isinstance(resp, dict) else None):
+        if isinstance(holder, dict):
+            v = holder.get("image_ref")
+            if isinstance(v, str) and v.startswith("asset://") and len(v) > len("asset://"):
+                return v
+    return ""
+
+
 def _is_durable_asset_url(url: str) -> bool:
-    """Accept only durable ``/<slug>/assets/`` URLs; reject temporary transports
-    (``/media/...``), local paths and empty values."""
+    """Accept only durable ``/<slug>/assets/`` URLs (legacy engine); reject
+    temporary transports (``/media/...``), local paths and empty values."""
     u = str(url or "")
     if not u.lower().startswith("https://"):
         return False
     if "/media/" in u:
         return False
     return "/assets/" in u
+
+
+def _is_durable_upload(image_url: str, image_ref: str) -> bool:
+    """Durable = stored on the landing engine, safe to reference from a page.
+
+    * engine webbuild (TinoPage): the MCP returns ``image_ref: asset://<id>``
+      (content-addressed store) plus a public ``url`` under ``/a/<id>`` — the
+      ``asset://`` ref is the proof, the URL shape is not inspected.
+    * legacy engine: only ``/<slug>/assets/`` URLs count.
+    """
+    if image_ref:
+        return True
+    return _is_durable_asset_url(image_url)

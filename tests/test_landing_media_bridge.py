@@ -203,6 +203,56 @@ class TestUploadRecent(unittest.TestCase):
         with self.assertRaises(BridgeError):
             b.upload_recent(task_id="s", slug="s")
 
+    def test_tinopage_asset_ref_is_durable_and_returned(self):
+        """Engine webbuild (TinoPage): the MCP answers ``image_ref: asset://<id>``
+        and a public ``image_url`` under ``/a/<id>`` (no ``/assets/`` segment).
+        Regression: the legacy-only URL check rejected EVERY TinoPage upload as
+        "non-durable" (0 successful Zalo photo uploads from 21/08 to 04/09)."""
+        p = self._img("x.jpg")
+        b = self._bridge(
+            [_Rec(p)],
+            {"chat_id": "c", "conv_id": "c"},
+            {"slug": "s", "engine": "webbuild",
+             "image_ref": "asset://up-0123456789abcdef",
+             "image_url": "https://builder.tino.page/a/up-0123456789abcdef"},
+        )
+        out = b.upload_recent(task_id="s", slug="s")
+        img = out["images"][0]
+        self.assertEqual(img["image_ref"], "asset://up-0123456789abcdef")
+        self.assertEqual(img["image_url"], "https://builder.tino.page/a/up-0123456789abcdef")
+
+    def test_tinopage_ref_nested_in_result_envelope(self):
+        p = self._img("x.jpg")
+        b = self._bridge(
+            [_Rec(p)],
+            {"chat_id": "c", "conv_id": "c"},
+            {"result": {"image_ref": "asset://up-aaaa", "image_url": "https://b/a/up-aaaa"}},
+        )
+        img = b.upload_recent(task_id="s", slug="s")["images"][0]
+        self.assertEqual(img["image_ref"], "asset://up-aaaa")
+
+    def test_legacy_url_has_no_image_ref_key(self):
+        p = self._img("x.jpg")
+        b = self._bridge(
+            [_Rec(p)],
+            {"chat_id": "c", "conv_id": "c"},
+            {"image_url": "https://landingpage.tino.vn/s/assets/n.jpg"},
+        )
+        img = b.upload_recent(task_id="s", slug="s")["images"][0]
+        self.assertNotIn("image_ref", img)
+
+    def test_bogus_ref_does_not_rescue_temporary_url(self):
+        """A non-``asset://`` ref must not turn a /media/ transport URL durable."""
+        p = self._img("x.jpg")
+        b = self._bridge(
+            [_Rec(p)],
+            {"chat_id": "c", "conv_id": "c"},
+            {"image_ref": "/opt/data/zalo/media-cache/x.jpg",
+             "image_url": "https://mcp.tino.vn/media/tmp123.jpg"},
+        )
+        with self.assertRaises(BridgeError):
+            b.upload_recent(task_id="s", slug="s")
+
     def test_same_bytes_same_remote_name(self):
         p1 = self._img("a.jpg")
         p2 = self._img("b.jpg")  # identical bytes

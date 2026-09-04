@@ -8998,11 +8998,32 @@ def _zalo_upload_recent_image_to_landing_handler(args: Any = None, **kwargs) -> 
     return {
         "success": True,
         **result,
-        "hint": (
-            "Dùng images[n].image_url làm hero_image/gallery rồi gọi "
-            "landing_update(slug, data={...}). KHÔNG cần base64."
-        ),
+        "hint": _landing_bridge_hint(result),
     }
+
+
+def _landing_bridge_hint(result: Dict[str, Any]) -> str:
+    """Tell the agent how to PLACE the uploaded image, per landing engine.
+
+    TinoPage (engine webbuild) returns ``image_ref`` = ``asset://<id>``; the
+    block prop must receive that ref through ``landing_update`` ops. The legacy
+    HTML engine only has ``image_url`` and takes it as ``hero_image``/gallery.
+    """
+    images = result.get("images") if isinstance(result, dict) else None
+    refs = [i.get("image_ref") for i in (images or []) if isinstance(i, dict) and i.get("image_ref")]
+    if refs:
+        return (
+            "Ảnh đã lên TinoPage. Gọi mcp_tino_landing_get(slug) để biết index/prop ảnh "
+            "của khối (hero: path \"image\"; gallery: \"images.<n>.image\"), rồi "
+            "mcp_tino_landing_update(slug, data={\"ops\": [{\"op\": \"updateBlock\", "
+            "\"index\": <số khối>, \"path\": \"image\", \"value\": \"%s\"}]}). "
+            "Dùng images[n].image_ref (asset://...), KHÔNG dùng image_url, KHÔNG cần base64."
+            % refs[0]
+        )
+    return (
+        "Dùng images[n].image_url làm hero_image/gallery rồi gọi "
+        "landing_update(slug, data={...}). KHÔNG cần base64."
+    )
 
 
 def _zalo_api_call_handler(args: Any = None, **kwargs) -> Dict[str, Any]:
@@ -11161,13 +11182,15 @@ def _register_zalo_tools(ctx) -> None:
             schema={"type": "function", "function": {
                 "name": "zalo_upload_recent_image_to_landing",
                 "description": (
-                    "Đưa ẢNH GẦN NHẤT khách gửi trong chat HIỆN TẠI lên landing DEMO của "
-                    "đúng hội thoại này, TRẢ VỀ image_url công khai. Dùng khi khách gửi ảnh "
-                    "qua Zalo và cần gắn lên landing (hero/banner/gallery). Upload chạy nền "
-                    "server-to-server — KHÔNG kéo base64 qua hội thoại. Ảnh được TỰ ĐỘNG "
-                    "thu nhỏ về tối đa 1024px trước khi upload (ảnh điện thoại cỡ lớn vẫn "
-                    "up được). Sau khi có images[n].image_url, gọi "
-                    "landing_update(slug, data={...}) để gắn ảnh."),
+                    "Đưa ẢNH GẦN NHẤT khách gửi trong chat HIỆN TẠI lên landing của đúng "
+                    "hội thoại này. Dùng khi khách gửi ảnh qua Zalo và cần gắn lên landing "
+                    "(hero/banner/gallery). Upload chạy nền server-to-server — KHÔNG kéo "
+                    "base64 qua hội thoại. Ảnh được TỰ ĐỘNG thu nhỏ về tối đa 1024px trước "
+                    "khi upload. BẮT BUỘC truyền slug (lấy từ landing_build/landing_list). "
+                    "Trả images[n].image_ref (asset://..., trang mẫu TinoPage) → đặt vào khối "
+                    "bằng landing_update(slug, data={\"ops\": [{\"op\": \"updateBlock\", "
+                    "\"index\": N, \"path\": \"image\", \"value\": image_ref}]}); "
+                    "trang HTML cũ chỉ có images[n].image_url → dùng làm hero_image."),
                 "parameters": {"type": "object", "properties": {
                     "slug": {"type": "string", "description": (
                         "Slug landing CÓ THẬT của hội thoại (từ landing_build trước đó hoặc "

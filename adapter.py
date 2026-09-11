@@ -4944,6 +4944,37 @@ def _resolve_session_user_id(session_id: str) -> Optional[str]:
     return None
 
 
+# Tool của kênh Zalo OA (tiền tố oa_) ↔ tool cùng chức năng của kênh cá nhân.
+# Plugin zalo-oa đăng ký oa_* vào registry chung từ 10/09; model gọi chúng cả
+# trong chat cá nhân rồi rơi vào deny cuối hook. Câu từ chối ở đó nói "chỉ chạy
+# cho chủ tài khoản", model hiểu là hết quyền nên quay ra bảo khách gửi lại ảnh
+# — đo 11/09 trên vnnic-dn: 71 lượt gọi nhầm/ngày, 44 phiên khách không nhận
+# được ảnh dù ảnh đã nằm trên máy chủ. Chỉ đường sang tool đúng kênh.
+_TOOL_OA_SANG_CA_NHAN = {
+    "oa_upload_recent_image_to_landing": "zalo_upload_recent_image_to_landing",
+    "oa_send_image": "zalo_send_image",
+    "oa_send_file": "zalo_send_file",
+}
+
+
+def goi_y_tool_dung_kenh(base_name: str) -> Optional[Dict[str, str]]:
+    """Câu chặn kèm tên tool thay thế khi model gọi tool kênh OA ở chat cá nhân.
+
+    None nếu không phải tool của kênh OA (để hook đi tiếp luồng deny thường).
+    """
+    thay_the = _TOOL_OA_SANG_CA_NHAN.get((base_name or "").lower().strip())
+    if not thay_the:
+        return None
+    return {
+        "action": "block",
+        "message": (
+            f"Tool này chỉ dùng cho kênh Zalo OA. Hội thoại hiện tại là Zalo "
+            f"cá nhân — gọi lại {thay_the} với đúng tham số vừa rồi. "
+            "KHÔNG báo khách gửi lại ảnh: ảnh khách gửi vẫn còn trên máy chủ."
+        ),
+    }
+
+
 def _zalo_pre_tool_call_hook(
     tool_name: str = "",
     args: Optional[Dict[str, Any]] = None,
@@ -5158,6 +5189,16 @@ def _zalo_pre_tool_call_hook(
             _hourly_quota_bump(_schedule_reminder_quota_path(), current_chat_id, user_id)
             return None
         return None
+
+    # Gọi nhầm tool của kênh OA: chặn nhưng chỉ đường sang tool đúng kênh.
+    goi_y = goi_y_tool_dung_kenh(base_name)
+    if goi_y:
+        logger.warning(
+            f"[zalo-personal] SAI KÊNH tool={tool_name} → "
+            f"{_TOOL_OA_SANG_CA_NHAN[base_name]} "
+            f"(user_id={user_id}, session {session_id})"
+        )
+        return goi_y
 
     # Mọi tool còn lại: từ chối. Phân biệt log "known-blocked" với "unknown"
     # để vận hành dễ soi, nhưng kết quả như nhau (deny).

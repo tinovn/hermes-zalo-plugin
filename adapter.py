@@ -853,11 +853,11 @@ class ZaloPersonalAdapter(BasePlatformAdapter):
         self.ws_url = f"ws://127.0.0.1:{self.sidecar_port}/events"
 
         # Owner UID — Zalo UID của chủ tài khoản (nhắn từ Zalo chính)
-        self.owner_uid = (os.getenv("ZALO_PERSONAL_OWNER_UID") or extra.get("owner_uid", "")).strip()
+        self.owner_uid = str(os.getenv("ZALO_PERSONAL_OWNER_UID") or extra.get("owner_uid", "")).strip()
 
         # Identity mapping: khi owner nhắn, map về user_id Hermes này (chung
         # session/memory với Telegram). Default: dùng OWNER_UID làm user_id.
-        self.owner_user_id = (
+        self.owner_user_id = str(
             os.getenv("ZALO_PERSONAL_OWNER_USER_ID")
             or extra.get("owner_user_id", "")
             or self.owner_uid

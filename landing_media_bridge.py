@@ -7,9 +7,12 @@ bytes of. The model only receives durable ``image_url`` metadata (plus
 ``image_ref`` = ``asset://<id>`` when the landing engine is TinoPage/webbuild).
 
 Security contract (see plan Phase 3):
-  * The model supplies only ``slug`` (+ optional ``filename``/``count``). It can
-    NOT pass ``chat_id``, a local path, or a session id — those come from the
-    trusted Hermes ``task_id`` and the recent-image index.
+  * The model supplies only ``slug`` (+ optional ``filename``/``count``/``vi_tri``).
+    It can NOT pass ``chat_id``, a local path, or a session id — those come from
+    the trusted Hermes ``task_id`` and the recent-image index. ``vi_tri``
+    ``{page, index, path?}`` names a SLOT ON THE PAGE (from ``landing_map``), never
+    a file: it is shape-checked here and the MCP only attaches into a verified
+    ``format:image`` slot (an owner-less bridge call can never edit text/blocks).
   * The cached file is opened with ``O_NOFOLLOW`` relative to the media-cache
     directory fd; ``fstat`` / size-check / read / magic / SHA-256 all happen on
     that same descriptor (no check-then-open TOCTOU, no symlink escape).
@@ -56,7 +59,55 @@ _STEM_RE = re.compile(r"[^a-z0-9]+")
 
 
 class BridgeError(Exception):
-    """Raised for any validation/authorization failure (fail closed)."""
+    """Raised for any validation/authorization failure (fail closed).
+
+    ``details`` carries the MCP's machine hints for slot errors (``code``,
+    ``o_anh`` choices, ``next_step``) so the agent can ask the customer which
+    image to replace instead of guessing — never bytes, keys or local paths.
+    """
+
+    def __init__(self, message: str, details: Optional[Dict[str, Any]] = None):
+        super().__init__(message)
+        self.details = details or {}
+
+
+# A page slot path from landing_map: ``image``, ``items.1.image``, ``items[1].image``.
+_SLOT_PATH_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+|\[\d+\])*$")
+# What the MCP returns after attaching into the page — forwarded to the agent as-is.
+_ATTACH_KEYS = ("gan_vao_trang", "vi_tri", "url", "message", "loi_gan",
+                "ban_nhap_cua_khach", "dang_duoc", "missing")
+
+
+def normalize_vi_tri(raw: Any) -> Optional[Dict[str, Any]]:
+    """Validate the model-supplied page slot; returns ``{page, index, path?}`` or None.
+
+    Only these three keys are forwarded (the MCP input forbids extras). Accepts a
+    JSON string because some models serialize nested objects.
+    """
+    if raw in (None, "", {}):
+        return None
+    if isinstance(raw, str):
+        import json as _json
+        try:
+            raw = _json.loads(raw)
+        except ValueError:
+            raise BridgeError("vi_tri must be an object {page, index, path?} from landing_map")
+    if not isinstance(raw, dict):
+        raise BridgeError("vi_tri must be an object {page, index, path?} from landing_map")
+    try:
+        page = int(raw.get("page") or 0)
+        index = int(raw["index"])
+    except (KeyError, TypeError, ValueError):
+        raise BridgeError("vi_tri.index (integer from landing_map) is required")
+    if not (0 <= page <= 50 and 0 <= index <= 500):
+        raise BridgeError("vi_tri page/index out of range")
+    out: Dict[str, Any] = {"page": page, "index": index}
+    path = str(raw.get("path") or "").strip()
+    if path:
+        if len(path) > 120 or not _SLOT_PATH_RE.match(path):
+            raise BridgeError("vi_tri.path must be a slot path like 'image' or 'items.1.image'")
+        out["path"] = path
+    return out
 
 
 def sanitize_stem(stem: Optional[str], fallback: str = "img") -> str:
@@ -163,10 +214,12 @@ class LandingMediaBridge:
         self._post = http_post
 
     def upload_recent(self, *, task_id: str, slug: str,
-                      filename: Optional[str] = None, count: int = 1) -> Dict[str, Any]:
+                      filename: Optional[str] = None, count: int = 1,
+                      vi_tri: Any = None) -> Dict[str, Any]:
         slug = str(slug or "").strip()
         if not slug:
             raise BridgeError("slug required")
+        slot = normalize_vi_tri(vi_tri)
         # Trusted identity resolved from task_id ONLY (model cannot override):
         #   chat_id  — selects the authorized recent-image namespace
         #   conv_id  — the Tino-MCP conversation id sent as X-Session. In this
@@ -184,6 +237,9 @@ class LandingMediaBridge:
             n = max(1, min(int(count), 5))
         except (TypeError, ValueError):
             n = 1
+        if slot and n > 1:
+            # One slot takes one image; several would overwrite each other.
+            raise BridgeError("vi_tri places ONE image: call with count=1")
 
         recents = self._recent(chat_id, n)  # oldest→newest
         if not recents:
@@ -207,7 +263,7 @@ class LandingMediaBridge:
                 raise BridgeError("image too large")
             digest = hashlib.sha256(data).hexdigest()
             remote_name = content_addressed_name(filename, digest, ext)
-            uploaded = self._upload_one(conv_id, slug, data, mime, remote_name)
+            uploaded = self._upload_one(conv_id, slug, data, mime, remote_name, vi_tri=slot)
             entry: Dict[str, Any] = {
                 "image_url": uploaded["image_url"],
                 "filename": remote_name,
@@ -223,11 +279,15 @@ class LandingMediaBridge:
                 entry["height"] = rr.height
             images.append(entry)
         # Compact result; never returns sender, local path, chat id or base64.
-        return {"slug": slug, "count": len(images), "images": images}
+        out: Dict[str, Any] = {"slug": slug, "count": len(images), "images": images}
+        if slot:
+            out.update(uploaded.get("attach") or {})
+        return out
 
     def _upload_one(self, conv_id: str, slug: str, data: bytes, mime: str,
-                    remote_name: str) -> Dict[str, str]:
-        """POST one image; returns ``{"image_url", "image_ref"?}`` (never bytes)."""
+                    remote_name: str, *, vi_tri: Optional[Dict[str, Any]] = None
+                    ) -> Dict[str, Any]:
+        """POST one image; returns ``{"image_url", "image_ref"?, "attach"?}`` (never bytes)."""
         import base64 as _b64
         headers = {
             "X-Agent-Key": self._cfg.key,
@@ -241,6 +301,8 @@ class LandingMediaBridge:
             "image_base64": "data:%s;base64,%s" % (mime, _b64.b64encode(data).decode()),
             "filename": remote_name,
         }
+        if vi_tri:
+            body["vi_tri"] = vi_tri  # MCP attaches into this verified image slot
         resp = self._post(self._cfg.url, headers, body) or {}
         image_url = _extract_image_url(resp)
         image_ref = _extract_image_ref(resp)
@@ -250,13 +312,25 @@ class LandingMediaBridge:
             # left the agent guessing). Never include the key or the payload.
             err = _extract_error_message(resp)
             raise BridgeError(f"upload rejected: {err}" if err
-                              else "upload failed: no image_url in response")
+                              else "upload failed: no image_url in response",
+                              details=_slot_details(resp))
         if not _is_durable_upload(image_url, image_ref):
             raise BridgeError("upload returned a non-durable URL")
-        out = {"image_url": image_url}
+        out: Dict[str, Any] = {"image_url": image_url}
         if image_ref:
             out["image_ref"] = image_ref
+        if vi_tri:
+            holder = resp.get("result") if isinstance(resp.get("result"), dict) else resp
+            out["attach"] = {k: holder[k] for k in _ATTACH_KEYS if k in holder}
         return out
+
+
+def _slot_details(resp: Dict[str, Any]) -> Dict[str, Any]:
+    """Slot-choice hints of a rejected vi_tri upload (code, o_anh, next_step)."""
+    holder = resp.get("result") if isinstance(resp, dict) else None
+    if not isinstance(holder, dict):
+        holder = resp if isinstance(resp, dict) else {}
+    return {k: holder[k] for k in ("code", "o_anh", "next_step") if k in holder}
 
 
 def _extract_error_message(resp: Dict[str, Any]) -> str:

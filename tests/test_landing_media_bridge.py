@@ -14,6 +14,7 @@ from landing_media_bridge import (
     LandingMediaBridge,
     content_addressed_name,
     load_bridge_config,
+    normalize_vi_tri,
     read_cached_image,
     sanitize_stem,
 )
@@ -274,6 +275,89 @@ class TestUploadRecent(unittest.TestCase):
             b.upload_recent(task_id="s", slug="s")
         self.assertIn("too large", str(cm.exception))
         self.assertEqual(self.posted, [])  # nothing left the process
+
+
+class TestViTri(unittest.TestCase):
+    """vi_tri = Ô TRÊN TRANG (từ landing_map), không phải đường dẫn file: kiểm dạng ở
+    plugin, chỉ chuyển page/index/path sang MCP (MCP kiểm ô format:image rồi tự gắn)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.posted = []
+        p = os.path.join(self.tmp, "x.jpg")
+        with open(p, "wb") as fh:
+            fh.write(JPEG)
+        self.rec = _Rec(p)
+
+    def _bridge(self, post_result, recents=None):
+        cfg = BridgeConfig(url="https://mcp.tino.vn/tools/landing_upload_image",
+                           key="secret-key", cache_dir=self.tmp)
+
+        def http_post(url, headers, body):
+            self.posted.append({"url": url, "headers": headers, "body": body})
+            return post_result
+
+        return LandingMediaBridge(
+            cfg, recent_fn=lambda chat_id, n: (recents or [self.rec])[:n],
+            session_resolver=lambda task_id: {"chat_id": "c", "conv_id": "c"},
+            http_post=http_post)
+
+    def test_normalize_only_forwards_page_index_path(self):
+        self.assertIsNone(normalize_vi_tri(None))
+        self.assertEqual(normalize_vi_tri({"index": 2, "junk": "x"}), {"page": 0, "index": 2})
+        self.assertEqual(normalize_vi_tri('{"page": 1, "index": 3, "path": "items[1].image"}'),
+                         {"page": 1, "index": 3, "path": "items[1].image"})
+        for bad in ({"page": 0}, {"index": -1}, {"index": 2, "path": "../etc/passwd"},
+                    {"index": 2, "path": "/opt/data/zalo/x.jpg"}, "khong-phai-json", [1, 2]):
+            with self.assertRaises(BridgeError):
+                normalize_vi_tri(bad)
+
+    def test_vi_tri_sent_and_attach_result_returned(self):
+        b = self._bridge({"image_ref": "asset://up-1", "image_url": "https://b/a/up-1",
+                          "gan_vao_trang": True, "vi_tri": {"page": 0, "index": 2, "path": "image"},
+                          "url": "https://b/tiem-nail", "message": "Đã thay ảnh"})
+        out = b.upload_recent(task_id="s", slug="s", vi_tri={"index": 2})
+        self.assertEqual(self.posted[0]["body"]["vi_tri"], {"page": 0, "index": 2})
+        self.assertTrue(out["gan_vao_trang"])
+        self.assertEqual(out["url"], "https://b/tiem-nail")
+        self.assertEqual(out["images"][0]["image_ref"], "asset://up-1")
+
+    def test_no_vi_tri_keeps_old_body(self):
+        b = self._bridge({"image_ref": "asset://up-1", "image_url": "https://b/a/up-1"})
+        out = b.upload_recent(task_id="s", slug="s")
+        self.assertNotIn("vi_tri", self.posted[0]["body"])
+        self.assertNotIn("gan_vao_trang", out)
+
+    def test_vi_tri_with_many_images_rejected_before_upload(self):
+        b = self._bridge({"image_ref": "asset://up-1"}, recents=[self.rec, self.rec])
+        with self.assertRaises(BridgeError):
+            b.upload_recent(task_id="s", slug="s", count=2, vi_tri={"index": 2})
+        self.assertEqual(self.posted, [])
+
+    def test_bad_vi_tri_rejected_before_upload(self):
+        b = self._bridge({"image_ref": "asset://up-1"})
+        with self.assertRaises(BridgeError):
+            b.upload_recent(task_id="s", slug="s", vi_tri={"index": 2, "path": "a b"})
+        self.assertEqual(self.posted, [])
+
+    def test_slot_choice_details_surface_for_agent(self):
+        b = self._bridge({"error": "invalid_parameter", "code": "CHON_O_ANH",
+                          "message": "Mục này có 2 ô ảnh, cần biết thay ảnh nào.",
+                          "o_anh": [{"path": "items.0.image", "label": "Ảnh"},
+                                    {"path": "items.1.image", "label": "Ảnh"}],
+                          "next_step": "Hỏi khách thay ảnh thứ mấy"})
+        with self.assertRaises(BridgeError) as cm:
+            b.upload_recent(task_id="s", slug="s", vi_tri={"index": 3})
+        self.assertEqual(cm.exception.details["code"], "CHON_O_ANH")
+        self.assertEqual(len(cm.exception.details["o_anh"]), 2)
+        self.assertIn("thay ảnh thứ mấy", cm.exception.details["next_step"])
+
+    def test_bridge_cannot_edit_text_error_surfaced(self):
+        b = self._bridge({"error": "forbidden",
+                          "message": "Cầu ảnh chỉ được gắn ảnh vào ô ảnh (format:image)"})
+        with self.assertRaises(BridgeError) as cm:
+            b.upload_recent(task_id="s", slug="s", vi_tri={"index": 2, "path": "heading"})
+        self.assertIn("ô ảnh", str(cm.exception))
 
 
 @unittest.skipUnless(HAS_PIL, "Pillow required")

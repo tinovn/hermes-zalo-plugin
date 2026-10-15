@@ -9148,8 +9148,9 @@ def _zalo_upload_recent_image_to_landing_handler(args: Any = None, **kwargs) -> 
     """Upload ảnh Zalo gần nhất của CHAT HIỆN TẠI vào landing (server-to-server).
 
     Thay cho zalo_recent_image_base64: base64 KHÔNG bao giờ đi qua LLM. Chỉ nhận
-    slug (+ filename/count tuỳ chọn); chat/session lấy từ task_id tin cậy, không
-    nhận chat_id/path do model truyền.
+    slug (+ filename/count/vi_tri tuỳ chọn); chat/session lấy từ task_id tin cậy,
+    không nhận chat_id/path do model truyền. ``vi_tri`` là Ô TRÊN TRANG (từ
+    landing_map), MCP tự gắn ảnh vào đúng ô ảnh đó.
     """
     p = _extract_tool_params(args, kwargs)
     slug = _coerce_str_arg(p.get("slug", ""))
@@ -9168,14 +9169,24 @@ def _zalo_upload_recent_image_to_landing_handler(args: Any = None, **kwargs) -> 
         )
         result = bridge.upload_recent(
             task_id=_coerce_str_arg(kwargs.get("task_id", "")),
-            slug=slug, filename=filename, count=count,
+            slug=slug, filename=filename, count=count, vi_tri=p.get("vi_tri"),
         )
     except _LandingBridgeError as e:
         err = str(e)
+        details = getattr(e, "details", None) or {}
+        if details.get("code") or details.get("o_anh"):
+            # Ô ảnh chưa rõ/sai (CHON_O_ANH, KHONG_PHAI_O_ANH…): đưa nguyên danh sách ô để
+            # agent hỏi khách thay ảnh nào, ảnh vẫn còn trong chat nên gọi lại được.
+            return {"success": False, "error": err, **details,
+                    "hint": details.get("next_step") or
+                    "Chọn path trong o_anh (hoặc mcp_tino_landing_map(index=…)) rồi gọi lại."}
         # Targeted hints so the agent self-corrects instead of blaming the photo:
         # a rejected upload usually means WRONG SLUG (agent invented one from the
         # image content) or an ownership problem — not a broken image.
-        if "upload rejected" in err or "not_found" in err or "hội thoại khác" in err:
+        if "ô ảnh" in err:
+            hint = ("vi_tri phải trỏ vào một Ô ẢNH của mục: mcp_tino_landing_map(slug, index=<mục>) "
+                    "xem các ô format:image rồi gọi lại với đúng path.")
+        elif "upload rejected" in err or "not_found" in err or "hội thoại khác" in err:
             hint = ("Slug có thể SAI hoặc landing không thuộc hội thoại này. Gọi "
                     "mcp_tino_landing_list để lấy đúng slug landing của hội thoại, "
                     "rồi gọi lại tool này với slug đó. KHÔNG tự bịa slug từ nội dung ảnh.")
@@ -9197,18 +9208,25 @@ def _zalo_upload_recent_image_to_landing_handler(args: Any = None, **kwargs) -> 
 def _landing_bridge_hint(result: Dict[str, Any]) -> str:
     """Tell the agent how to PLACE the uploaded image, per landing engine.
 
-    TinoPage (engine webbuild) returns ``image_ref`` = ``asset://<id>``; the
-    block prop must receive that ref through ``landing_update`` ops. The legacy
-    HTML engine only has ``image_url`` and takes it as ``hero_image``/gallery.
+    With ``vi_tri`` the MCP already attached the image (``gan_vao_trang``) or says
+    why not (``loi_gan``). Otherwise TinoPage (engine webbuild) returns
+    ``image_ref`` = ``asset://<id>`` for a ``landing_update`` op on a
+    ``format:image`` slot. The legacy HTML engine only has ``image_url``.
     """
+    if result.get("gan_vao_trang"):
+        return "Ảnh đã gắn vào đúng chỗ trên trang. Báo khách xem lại trang: %s" % (
+            result.get("url") or "")
+    if result.get("loi_gan"):
+        return ("Ảnh đã tải lên nhưng CHƯA gắn được vào trang: làm theo loi_gan (next_step), "
+                "rồi gắn images[0].image_ref bằng mcp_tino_landing_update updateBlock.")
     images = result.get("images") if isinstance(result, dict) else None
     refs = [i.get("image_ref") for i in (images or []) if isinstance(i, dict) and i.get("image_ref")]
     if refs:
         return (
-            "Ảnh đã lên TinoPage. Gọi mcp_tino_landing_get(slug) để biết index/prop ảnh "
-            "của khối (hero: path \"image\"; gallery: \"images.<n>.image\"), rồi "
-            "mcp_tino_landing_update(slug, data={\"ops\": [{\"op\": \"updateBlock\", "
-            "\"index\": <số khối>, \"path\": \"image\", \"value\": \"%s\"}]}). "
+            "Ảnh đã lên TinoPage, CHƯA gắn vào trang. Để thay ảnh một mục: "
+            "mcp_tino_landing_map(slug) chọn mục rồi gọi lại tool này kèm vi_tri "
+            "{page, index, path?}. Hoặc mcp_tino_landing_update updateBlock vào ô "
+            "format:image (path lấy từ mcp_tino_landing_map(slug, index=…)) với value \"%s\". "
             "Dùng images[n].image_ref (asset://...), KHÔNG dùng image_url, KHÔNG cần base64."
             % refs[0]
         )
@@ -11462,20 +11480,28 @@ def _register_zalo_tools(ctx) -> None:
                 "name": "zalo_upload_recent_image_to_landing",
                 "description": (
                     "Đưa ẢNH GẦN NHẤT khách gửi trong chat HIỆN TẠI lên landing của đúng "
-                    "hội thoại này. Dùng khi khách gửi ảnh qua Zalo và cần gắn lên landing "
-                    "(hero/banner/gallery). Upload chạy nền server-to-server — KHÔNG kéo "
-                    "base64 qua hội thoại. Ảnh được TỰ ĐỘNG thu nhỏ về tối đa 1024px trước "
-                    "khi upload. BẮT BUỘC truyền slug (lấy từ landing_build/landing_list). "
-                    "Trả images[n].image_ref (asset://..., trang mẫu TinoPage) → đặt vào khối "
-                    "bằng landing_update(slug, data={\"ops\": [{\"op\": \"updateBlock\", "
-                    "\"index\": N, \"path\": \"image\", \"value\": image_ref}]}); "
+                    "hội thoại này. Upload chạy nền server-to-server — KHÔNG kéo base64 qua "
+                    "hội thoại; ảnh TỰ thu nhỏ về tối đa 1024px. BẮT BUỘC truyền slug (từ "
+                    "landing_build/landing_list). Thay ảnh một mục trên trang mẫu TinoPage: "
+                    "landing_map(slug) chọn mục rồi truyền vi_tri={page, index, path?} → ảnh "
+                    "TỰ GẮN đúng ô ảnh (count=1). Không vi_tri: trả images[n].image_ref "
+                    "(asset://...) để gắn bằng landing_update updateBlock vào ô format:image; "
                     "trang HTML cũ chỉ có images[n].image_url → dùng làm hero_image."),
                 "parameters": {"type": "object", "properties": {
                     "slug": {"type": "string", "description": (
                         "Slug landing CÓ THẬT của hội thoại (từ landing_build trước đó hoặc "
                         "mcp_tino_landing_list). TUYỆT ĐỐI không tự bịa slug từ nội dung ảnh.")},
                     "filename": {"type": "string", "description": "Tên gợi ý cho ảnh (tuỳ chọn)"},
-                    "count": {"type": "integer", "description": "Số ảnh gần nhất cần up (1-5, mặc định 1)"}},
+                    "count": {"type": "integer", "description": "Số ảnh gần nhất cần up (1-5, mặc định 1)"},
+                    "vi_tri": {"type": "object", "description": (
+                        "Ô ảnh cần thay, lấy từ landing_map: page (trang, mặc định 0), index "
+                        "(mục), path (ô ảnh, vd 'items.1.image'; bỏ trống khi mục chỉ có 1 ô "
+                        "ảnh). Có vi_tri thì chỉ gửi 1 ảnh."),
+                        "properties": {
+                            "page": {"type": "integer"},
+                            "index": {"type": "integer"},
+                            "path": {"type": "string"}},
+                        "required": ["index"]}},
                     "required": ["slug"]}}},
             handler=_zalo_upload_recent_image_to_landing_handler,
             description="Up ảnh Zalo gần nhất lên landing (server-to-server, không base64).", emoji="🖼")

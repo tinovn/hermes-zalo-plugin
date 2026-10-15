@@ -1,7 +1,7 @@
 name: zalo-personal-platform
 label: Zalo (cá nhân)
 kind: platform
-version: 1.1.0
+version: 1.2.0
 description: >
   Adapter Zalo cá nhân cho Hermes Agent qua sidecar Node.js (zca-js).
   Dùng Zalo Web API không chính thức — KHUYẾN NGHỊ dùng SỐ PHỤ, không dùng số
